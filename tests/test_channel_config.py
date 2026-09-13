@@ -7,6 +7,7 @@ import copy
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from src.utils.channel_config import (
     CHANNEL_CONFIG_PATH,
@@ -53,6 +54,35 @@ def test_get_channel_policy_is_cached():
     first = get_channel_policy()
     second = get_channel_policy()
     assert first is second
+
+
+def test_channel_policy_top_level_mutation_is_rejected():
+    """ChannelPolicy itself is frozen (via _StrictModel), not just its
+    nested sections — reassigning a top-level section must also raise."""
+    policy = get_channel_policy()
+
+    with pytest.raises(ValidationError):
+        policy.motion = policy.motion
+
+
+def test_channel_policy_nested_motion_mutation_is_rejected_and_cache_survives():
+    """A caller must not be able to corrupt the shared, cached instance by
+    mutating a nested field in place."""
+    policy = get_channel_policy()
+
+    with pytest.raises(ValidationError):
+        policy.motion.veo_api_enabled = True
+
+    assert get_channel_policy().motion.veo_api_enabled is False
+
+
+def test_channel_policy_nested_budget_mutation_is_rejected_and_cache_survives():
+    policy = get_channel_policy()
+
+    with pytest.raises(ValidationError):
+        policy.budget.automatic_payment_allowed = True
+
+    assert get_channel_policy().budget.automatic_payment_allowed is False
 
 
 def test_load_channel_policy_valid_copy_round_trips(base_config_dict, tmp_path):

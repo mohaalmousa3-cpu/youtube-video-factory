@@ -32,9 +32,15 @@ class ChannelConfigError(Exception):
 
 class _StrictModel(BaseModel):
     """Unknown keys are rejected, not silently ignored — a typo'd policy
-    key (e.g. 'bakground_music_enabled') must fail loudly, not be dropped."""
+    key (e.g. 'bakground_music_enabled') must fail loudly, not be dropped.
+    frozen=True makes every field read-only after construction (Pydantic
+    raises on assignment) — get_channel_policy() hands out one shared,
+    lru_cache'd instance to every caller, so mutating a field in place
+    would corrupt the cache for everyone else. This is enforced at
+    runtime, not just documented: see the mutation-rejection tests in
+    tests/test_channel_config.py."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class ChannelSettings(_StrictModel):
@@ -90,13 +96,16 @@ class ChannelPolicy(_StrictModel):
     """Root policy document, one-to-one with config/channel-config.yaml's
     top-level sections.
 
-    Callers must treat the object returned by get_channel_policy() as
-    read-only. Pydantic models are mutable by default, but get_channel_policy()
-    is lru_cache-wrapped: every caller in the process receives the *same*
-    instance, not a copy, so mutating a field in place would corrupt the
-    cache for everyone else. If a caller needs a modified view, copy it
-    first — e.g. `policy.model_copy(deep=True)` — rather than assigning
-    into an existing instance's fields.
+    Every model in this hierarchy (including this one, via _StrictModel's
+    frozen=True) is actually immutable at runtime, not just documented as
+    such: get_channel_policy() hands the same lru_cache'd instance to every
+    caller, and attribute assignment on any field — top-level or nested,
+    e.g. `policy.motion.veo_api_enabled = True` — raises a pydantic
+    ValidationError instead of silently corrupting that shared instance.
+    A caller that needs a *different* value should call get_channel_policy()
+    fresh, or build a new instance with
+    `policy.model_copy(update={...})` (model_copy bypasses frozen checks by
+    design — it constructs a new instance rather than mutating this one).
     """
 
     channel: ChannelSettings
@@ -143,8 +152,10 @@ def load_channel_policy(path: Path) -> ChannelPolicy:
 def get_channel_policy() -> ChannelPolicy:
     """Cached accessor for config/channel-config.yaml — parsed/validated
     once per process. The returned ChannelPolicy is shared by every caller
-    (lru_cache returns the same instance, not a copy) — treat it as
-    read-only, see the ChannelPolicy docstring. Not yet called from any
-    provider, renderer, or CLI command (see src/utils/config.py's
-    get_runtime_config() for the one Phase 1B integration point)."""
+    (lru_cache returns the same instance, not a copy) and is frozen, so
+    attribute assignment on it (or any nested model) raises instead of
+    corrupting the shared cache — see the ChannelPolicy docstring. Not yet
+    called from any provider, renderer, or CLI command (see
+    src/utils/config.py's get_runtime_config() for the one Phase 1B
+    integration point)."""
     return load_channel_policy(CHANNEL_CONFIG_PATH)
