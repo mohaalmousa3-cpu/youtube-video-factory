@@ -1,0 +1,58 @@
+{
+  "manifest_version": "1.0",
+  "story_id": "why-we-care-what-people-think",
+  "language": "en",
+  "role_outfit_ref": "narrator-default",
+  "scenes": [
+    {
+      "scene_id": "scene-01",
+      "narration_text": "Why does being left out sting so much? It turns out your brain isn't being dramatic.",
+      "visual_prompt": {
+        "base_description": "The stickman character stands alone on a quiet street corner at dusk, looking toward a lit window.",
+        "uses_character_anchor": true,
+        "uses_color_anchor": true,
+        "uses_safety_suffix": true,
+        "reference_image_paths": ["data/character_refs/narrator-default-v1.png"],
+        "requires_text_adjacent_spotcheck": false
+      },
+      "motion": "in",
+      "mouth_animation": { "enabled": false },
+      "limb_sway": { "enabled": false },
+      "text_overlay": { "enabled": false },
+      "duration_seconds": 5.2,
+      "duration_source": "measured_audio",
+      "audio_file_path": "data/audio/why-we-care-what-people-think/scene-01.wav"
+    },
+    {
+      "scene_id": "scene-02",
+      "narration_text": "Researchers call this the Cyberball game.",
+      "visual_prompt": {
+        "base_description": "The stickman character sits at a desk, watching a simple ball-toss game on a laptop screen.",
+        "uses_character_anchor": true,
+        "uses_color_anchor": true,
+        "uses_safety_suffix": true,
+        "reference_image_paths": ["data/character_refs/narrator-default-v1.png"],
+        "requires_text_adjacent_spotcheck": true
+      },
+      "motion": "pan_lr",
+      "mouth_animation": { "enabled": false },
+      "limb_sway": { "enabled": false },
+      "text_overlay": { "enabled": true, "text": "The Cyberball Game" },
+      "duration_seconds": 4.1,
+      "duration_source": "measured_audio",
+      "audio_file_path": "data/audio/why-we-care-what-people-think/scene-02.wav"
+    }
+  ],
+  "budget": {
+    "incremental_cost_usd": 0,
+    "paid_services_used": []
+  },
+  "motion_policy": {
+    "veo_api_enabled": false,
+    "manual_flow_task_refs": []
+  },
+  "background_music_enabled": false,
+  "total_duration_seconds": 9.3,
+  "total_duration_source": "measured_audio",
+  "output_path": "data/output/why-we-care-what-people-think/final.mp4"
+}

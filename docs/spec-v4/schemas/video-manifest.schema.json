@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://youtube-video-factory.local/schemas/video-manifest.schema.json",
+  "title": "VideoManifest",
+  "description": "The single generated artifact fully describing one video's build. Replaces hand-maintained per-scene duration tables.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest_version", "story_id", "language", "role_outfit_ref", "scenes", "budget", "motion_policy", "total_duration_seconds", "total_duration_source"],
+  "properties": {
+    "manifest_version": { "type": "string", "const": "1.0" },
+    "story_id": { "type": "string" },
+    "language": { "const": "en" },
+    "role_outfit_ref": {
+      "type": "string",
+      "description": "id of the role-outfit record used for character identity lock across every scene."
+    },
+    "scenes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "scene.schema.json" }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["incremental_cost_usd", "paid_services_used"],
+      "properties": {
+        "incremental_cost_usd": {
+          "type": "number",
+          "const": 0,
+          "description": "Must be 0 unless an approved paid-proposal record justifies otherwise."
+        },
+        "paid_services_used": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 0,
+          "description": "Must be empty by default; a non-empty entry requires a matching approved paid-proposal id (see paid-proposal.schema.json)."
+        }
+      }
+    },
+    "motion_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["veo_api_enabled", "manual_flow_task_refs"],
+      "properties": {
+        "veo_api_enabled": { "const": false },
+        "manual_flow_task_refs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional, non-blocking manual-flow-task ids associated with this video. Video must be complete without any of them being actioned."
+        }
+      }
+    },
+    "background_music_enabled": { "const": false },
+    "total_duration_seconds": { "type": "number", "exclusiveMinimum": 0 },
+    "total_duration_source": { "const": "measured_audio" },
+    "output_path": { "type": "string" }
+  }
+}

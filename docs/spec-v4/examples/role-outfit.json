@@ -1,0 +1,16 @@
+{
+  "role_outfit_id": "narrator-default",
+  "version": 1,
+  "canonical_description": "Simple ink-line stickman figure, rounded head, slim proportions (roughly 1:6 head-to-body ratio), soft watercolor-wash skin tone, plain warm-grey trousers and a muted teal sweater as the default outfit. No facial features beyond simple dot eyes and an expressive line mouth. Always drawn with clean, un-hatched line work — no pencil crosshatch shading.",
+  "reference_image_paths": [
+    "data/character_refs/narrator-default-v1.png",
+    "data/character_refs/narrator-default-v1-alt-angle.png"
+  ],
+  "character_anchor_text": "The same recurring stickman narrator character: simple ink-line figure, rounded head, slim 1:6 head-to-body proportions, soft watercolor-wash skin tone, muted teal sweater and warm-grey trousers, simple dot eyes and expressive line mouth, clean un-hatched line work — keep identical proportions, palette, and facial simplicity in every scene.",
+  "outfit_variants": [
+    {
+      "context": "rain scene",
+      "description": "Adds a simple translucent rain slicker over the default teal sweater; proportions and palette otherwise unchanged."
+    }
+  ]
+}

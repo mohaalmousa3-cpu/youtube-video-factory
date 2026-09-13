@@ -1,0 +1,23 @@
+{
+  "story_id": "why-we-care-what-people-think",
+  "title": "Why We Care So Much What People Think",
+  "language": "en",
+  "hook": "Your brain treats being ignored like physical pain. Here's the research that proves it.",
+  "key_facts": [
+    {
+      "claim": "Social exclusion activates the same brain regions as physical pain.",
+      "source": "Kipling Williams' Cyberball ostracism studies"
+    },
+    {
+      "claim": "Even brief, anonymous exclusion from a game measurably lowers mood and self-esteem.",
+      "source": "Williams & Jarvis, Cyberball paradigm"
+    }
+  ],
+  "target_length_seconds": 480,
+  "tone": "calm",
+  "content_safety_notes": [
+    "Ostracism research design historically involved a real hate group in one variant — depict only unmarked, abstract silhouette figures, no robes/insignia/identifiable iconography."
+  ],
+  "creative_prompt_ref": "core-creative-v1",
+  "role_outfit_ref": "narrator-default"
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://youtube-video-factory.local/schemas/manual-flow-task.schema.json",
+  "title": "ManualFlowTask",
+  "description": "An optional, human-operated Google Flow motion-polish request. Never a blocking dependency for publishing a video (TECHNICAL-SPEC-EN.md section 6).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "story_id", "status", "blocking", "instructions", "input_clip_path"],
+  "properties": {
+    "task_id": { "type": "string" },
+    "story_id": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "in_progress", "done", "skipped"],
+      "description": "'skipped' is always a valid terminal state — the video must already be publishable without this task."
+    },
+    "blocking": {
+      "const": false,
+      "description": "Always false. A manual-flow-task must never gate publication."
+    },
+    "instructions": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable instructions per prompts/STAGE-PROMPTS.md's stage-manual-flow-note-v1: state it's optional, that a complete local render already exists, and what would benefit."
+    },
+    "input_clip_path": {
+      "type": "string",
+      "description": "The already-rendered local clip this task would polish."
+    },
+    "output_clip_path": {
+      "type": "string",
+      "description": "Set once a human completes the task and provides a Flow-polished replacement clip."
+    },
+    "local_fallback_clip_path": {
+      "type": "string",
+      "description": "The clip actually used if this task is never picked up. Should usually equal input_clip_path."
+    }
+  }
+}

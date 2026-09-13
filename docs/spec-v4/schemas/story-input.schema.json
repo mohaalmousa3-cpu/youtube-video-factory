@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://youtube-video-factory.local/schemas/story-input.schema.json",
+  "title": "StoryInput",
+  "description": "A single video idea before it has been broken into scenes. English viewer-facing fields only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["story_id", "title", "hook", "key_facts", "target_length_seconds", "tone", "language", "creative_prompt_ref"],
+  "properties": {
+    "story_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Stable slug, e.g. 'why-we-care-what-people-think'."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 200,
+      "description": "Working title. Viewer-facing (may be refined for the real upload title later)."
+    },
+    "language": {
+      "const": "en",
+      "description": "Viewer-facing language. Always English per channel policy."
+    },
+    "hook": {
+      "type": "string",
+      "minLength": 3,
+      "description": "The opening idea/question the video hooks on."
+    },
+    "key_facts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim"],
+        "properties": {
+          "claim": { "type": "string", "minLength": 3 },
+          "source": {
+            "type": "string",
+            "description": "Named study/phenomenon this claim is attributable to. Optional but recommended per CORE-CREATIVE-PROMPT.md content rules."
+          }
+        }
+      }
+    },
+    "target_length_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "A target only — final timing always comes from measured audio (see TECHNICAL-SPEC-EN.md section 7), never from this field."
+    },
+    "tone": {
+      "type": "string",
+      "enum": ["calm", "curious", "warm", "intimate", "tense", "somber"],
+      "description": "Feeds COLOR_ANCHOR wording choice; 'tense'/'somber' are the documented case where COLOR_ANCHOR's warm-flattening tradeoff should be reconsidered."
+    },
+    "content_safety_notes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Free-text notes for sensitive real-world references requiring an abstracted visual treatment (see CORE-CREATIVE-PROMPT.md)."
+    },
+    "creative_prompt_ref": {
+      "type": "string",
+      "description": "prompt_id from prompts/CORE-CREATIVE-PROMPT.md, e.g. 'core-creative-v1'."
+    },
+    "role_outfit_ref": {
+      "type": "string",
+      "description": "id of the role-outfit record to use for character identity lock. Defaults to the channel's single canonical record if omitted."
+    }
+  }
+}

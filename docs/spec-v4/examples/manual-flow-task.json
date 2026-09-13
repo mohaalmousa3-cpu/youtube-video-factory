@@ -1,0 +1,9 @@
+{
+  "task_id": "flow-task-001",
+  "story_id": "why-we-care-what-people-think",
+  "status": "proposed",
+  "blocking": false,
+  "instructions": "Optional: this clip (scene-07, the character watching the ball freeze mid-toss) could read as slightly more dynamic with Flow-generated in-between motion. The video is already complete and publishable using the local Ken Burns render at input_clip_path — this is a polish pass only, not a requirement, and there is no deadline tied to it.",
+  "input_clip_path": "data/output/why-we-care-what-people-think/clips/scene-07.mp4",
+  "local_fallback_clip_path": "data/output/why-we-care-what-people-think/clips/scene-07.mp4"
+}
