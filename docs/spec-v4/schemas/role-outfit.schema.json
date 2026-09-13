@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://youtube-video-factory.local/schemas/role-outfit.schema.json",
+  "title": "RoleOutfit",
+  "description": "The canonical character-identity record used to lock appearance across the whole channel (TECHNICAL-SPEC-EN.md section 9).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["role_outfit_id", "version", "canonical_description", "reference_image_paths", "character_anchor_text"],
+  "properties": {
+    "role_outfit_id": {
+      "type": "string",
+      "description": "e.g. 'narrator-default'. A channel normally has one canonical id used everywhere."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Bumped whenever the canonical appearance changes. Changing appearance must go through a new version, not an ad hoc per-video prompt edit."
+    },
+    "canonical_description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Full description of proportions, head shape, palette, default outfit."
+    },
+    "reference_image_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Image(s) passed to generate_with_reference() for every scene using this role-outfit."
+    },
+    "character_anchor_text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The exact CHARACTER_ANCHOR string appended to scene prompts, matching this record's canonical_description."
+    },
+    "outfit_variants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["context", "description"],
+        "properties": {
+          "context": {
+            "type": "string",
+            "description": "When this variant applies, e.g. 'rain scene', 'formal setting'."
+          },
+          "description": { "type": "string" }
+        }
+      },
+      "description": "Optional context-specific outfit variants layered on top of the canonical description, never replacing its core proportions/palette."
+    }
+  }
+}

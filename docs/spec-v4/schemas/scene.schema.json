@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://youtube-video-factory.local/schemas/scene.schema.json",
+  "title": "Scene",
+  "description": "One scene within a video-manifest. Narration/overlay text must be English (channel policy). Duration must trace to measured audio, never an estimate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scene_id", "narration_text", "visual_prompt", "motion", "duration_seconds", "duration_source"],
+  "properties": {
+    "scene_id": {
+      "type": "string",
+      "pattern": "^scene-[0-9]{2,3}$"
+    },
+    "narration_text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Spoken narration for this scene. Must be English."
+    },
+    "visual_prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_description", "uses_character_anchor", "uses_color_anchor", "uses_safety_suffix"],
+      "properties": {
+        "base_description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Scene-specific visual description, before CHARACTER_ANCHOR/COLOR_ANCHOR/SAFETY_SUFFIX are appended (see prompts/STAGE-PROMPTS.md)."
+        },
+        "uses_character_anchor": {
+          "type": "boolean",
+          "description": "Must be true whenever the character appears in this scene."
+        },
+        "uses_color_anchor": { "type": "boolean" },
+        "uses_safety_suffix": {
+          "const": true,
+          "description": "SAFETY_SUFFIX is always required — never optional."
+        },
+        "reference_image_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Reference image(s) passed to generate_with_reference() for character-identity lock."
+        },
+        "requires_text_adjacent_spotcheck": {
+          "type": "boolean",
+          "default": false,
+          "description": "True if the scene contains a screen/gauge/dial/sign — triggers the mandatory visual spot-check for baked-in text (see TECHNICAL-SPEC-EN.md section 4)."
+        }
+      }
+    },
+    "motion": {
+      "type": "string",
+      "enum": ["in", "out", "pan_lr", "pan_up", "static"],
+      "description": "Matches ffmpeg_render.ken_burns_clip's supported motion values."
+    },
+    "mouth_animation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "mouth_box_ref": {
+          "type": "string",
+          "description": "Identifier for a hand-measured MouthBox for this specific scene image. Not auto-detected (see character_rig.py docstring)."
+        }
+      }
+    },
+    "limb_sway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "limb_box_ref": {
+          "type": "string",
+          "description": "Identifier for a hand-measured LimbBox, sized for max swing angle x distance from pivot, not just resting silhouette."
+        }
+      }
+    },
+    "text_overlay": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "text": {
+          "type": "string",
+          "description": "Deterministically derived from narration_text; not a free LLM generation (see TECHNICAL-SPEC-EN.md section 8)."
+        }
+      }
+    },
+    "duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "duration_source": {
+      "const": "measured_audio",
+      "description": "Always measured_audio; a wpm-estimated or hand-guessed duration must never be persisted here."
+    },
+    "audio_file_path": {
+      "type": "string",
+      "description": "Path to the measured Kokoro narration audio this scene's duration was derived from."
+    }
+  }
+}

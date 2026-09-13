@@ -1,0 +1,8 @@
+{
+  "proposal_id": "proposal-veo-motion-2026-01",
+  "service_name": "veo-api",
+  "estimated_monthly_cost_usd": 18.00,
+  "justification": "Example only — illustrates the record shape. Would need to show that the local Ken Burns + mouth/limb-sway pipeline cannot meet a specific quality bar before this is worth proposing for real; not an active request as of this document.",
+  "status": "proposed",
+  "requires_explicit_user_approval": true
+}

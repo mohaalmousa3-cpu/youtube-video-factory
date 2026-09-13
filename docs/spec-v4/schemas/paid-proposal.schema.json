@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://youtube-video-factory.local/schemas/paid-proposal.schema.json",
+  "title": "PaidProposal",
+  "description": "A structured record of a proposal to enable a paid service. No paid call may be made unless a matching record here has status 'approved' (TECHNICAL-SPEC-EN.md section 5). The 25 USD emergency ceiling is a hard cap, not budget available to spend.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["proposal_id", "service_name", "estimated_monthly_cost_usd", "justification", "status", "requires_explicit_user_approval"],
+  "properties": {
+    "proposal_id": { "type": "string" },
+    "service_name": {
+      "type": "string",
+      "description": "e.g. 'veo-api', 'stock-music-license'."
+    },
+    "estimated_monthly_cost_usd": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 25,
+      "description": "Must not exceed the emergency ceiling; a proposal above it must be rejected outright, not partially approved."
+    },
+    "justification": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Why the $0-default pipeline cannot achieve the goal without this service."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "approved", "rejected", "expired"],
+      "description": "Only 'approved' permits any paid call. Default/initial value is 'proposed'."
+    },
+    "requires_explicit_user_approval": {
+      "const": true,
+      "description": "Always true. No automatic-approval path exists."
+    },
+    "approved_by": {
+      "type": "string",
+      "description": "Set only when status is 'approved' — who (the project owner) approved it."
+    },
+    "approved_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

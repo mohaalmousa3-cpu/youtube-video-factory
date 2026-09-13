@@ -1,0 +1,26 @@
+{
+  "scene_id": "scene-03",
+  "narration_text": "Researchers call this the Cyberball game. Three players toss a ball back and forth on screen — except two of them are just the computer, and they're about to freeze you out.",
+  "visual_prompt": {
+    "base_description": "The stickman character sits at a desk, watching a simple ball-toss game on a laptop screen, warm reading-lamp light on their face, cozy home office.",
+    "uses_character_anchor": true,
+    "uses_color_anchor": true,
+    "uses_safety_suffix": true,
+    "reference_image_paths": ["data/character_refs/narrator-default-v1.png"],
+    "requires_text_adjacent_spotcheck": true
+  },
+  "motion": "pan_lr",
+  "mouth_animation": {
+    "enabled": false
+  },
+  "limb_sway": {
+    "enabled": false
+  },
+  "text_overlay": {
+    "enabled": true,
+    "text": "The Cyberball Game"
+  },
+  "duration_seconds": 7.8,
+  "duration_source": "measured_audio",
+  "audio_file_path": "data/audio/why-we-care-what-people-think/scene-03.wav"
+}
