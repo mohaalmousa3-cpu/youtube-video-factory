@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://youtube-video-factory.local/schemas/queue-import.schema.json",
+  "title": "QueueImport",
+  "description": "Phase 1E local Story Queue import file. References story/scene content by file path, resolved relative to this file's own directory — it does not embed story/scene content inline. Added in Phase 1E to match src/models/queue.py; supersedes the inline-story shape shown in examples/queue-import.json prior to this phase (that shape predated Phase 1C's actual StoryInput model and does not match it — see the Phase 1E implementation report).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["queue_version", "items"],
+  "properties": {
+    "queue_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/queueItem" }
+    }
+  },
+  "$defs": {
+    "queueItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queue_item_id", "story_input_path", "scene_plan_path", "enabled"],
+      "properties": {
+        "queue_item_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Must be unique within this queue file's items array."
+        },
+        "story_input_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to a StoryInput JSON file, resolved relative to this queue file's own directory (never the process working directory). Must not resolve outside that directory — no override exists in Phase 1E to allow escaping it."
+        },
+        "scene_plan_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to a ScenePlan JSON file, resolved the same way as story_input_path."
+        },
+        "owner_notes": {
+          "type": ["string", "null"],
+          "description": "Owner-facing only — never read by the render pipeline, may be Arabic or any language."
+        },
+        "output_subdirectory": {
+          "type": ["string", "null"],
+          "description": "Optional override for where this project's manifest is saved under the CLI's --output-root: <output-root>/<output_subdirectory or the built project_id>/manifest.json. Resolved and traversal-checked against --output-root the same way story_input_path/scene_plan_path are checked against the queue directory."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Required, no default — every entry must explicitly opt in or out of an import run. Disabled entries are reported but never written."
+        }
+      }
+    }
+  }
+}

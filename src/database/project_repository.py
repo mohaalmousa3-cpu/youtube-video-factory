@@ -154,6 +154,19 @@ def list_project_transitions(conn: sqlite3.Connection, project_id: str) -> list[
     return [_row_to_transition(row) for row in rows]
 
 
+def delete_project(conn: sqlite3.Connection, project_id: str) -> None:
+    """Remove a project row and all its transition audit rows, atomically.
+
+    This exists solely for src/core/queue_import.py's best-effort rollback
+    when a multi-project queue import fails partway through — it is never
+    exposed as a CLI command (Phase 1E adds no destructive delete/overwrite
+    commands) and is not a general-purpose "delete a project" API. Safe to
+    call on a project_id that doesn't exist (deletes zero rows, no error)."""
+    with conn:
+        conn.execute("DELETE FROM project_transitions WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
+
+
 def save_transition(
     conn: sqlite3.Connection,
     expected_lifecycle_version: int,
