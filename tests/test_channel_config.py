@@ -72,6 +72,15 @@ def test_load_channel_policy_invalid_yaml_raises(tmp_path):
         load_channel_policy(path)
 
 
+def test_load_channel_policy_path_is_directory_raises(tmp_path):
+    """path.read_text() on a directory raises IsADirectoryError (an OSError
+    subclass) — must surface as ChannelConfigError, not propagate raw."""
+    directory = tmp_path / "channel-config.yaml"
+    directory.mkdir()
+    with pytest.raises(ChannelConfigError):
+        load_channel_policy(directory)
+
+
 def test_load_channel_policy_non_mapping_document_raises(tmp_path):
     path = tmp_path / "channel-config.yaml"
     path.write_text("- just\n- a\n- list\n")
@@ -98,6 +107,23 @@ def test_load_channel_policy_rejects_unknown_top_level_section(base_config_dict,
     data["publishing"] = {"auto_upload_enabled": True}
     with pytest.raises(ChannelConfigError):
         _write_and_load(tmp_path, data)
+
+
+def test_budget_automatic_payment_allowed_true_is_rejected(base_config_dict, tmp_path):
+    """Critical invariant: no config may set automatic_payment_allowed to
+    true — automatic payment must never happen regardless of any other
+    field's value."""
+    data = copy.deepcopy(base_config_dict)
+    data["budget"]["automatic_payment_allowed"] = True
+    with pytest.raises(ChannelConfigError):
+        _write_and_load(tmp_path, data)
+
+
+def test_budget_automatic_payment_allowed_false_is_accepted(base_config_dict, tmp_path):
+    data = copy.deepcopy(base_config_dict)
+    data["budget"]["automatic_payment_allowed"] = False
+    policy = _write_and_load(tmp_path, data)
+    assert policy.budget.automatic_payment_allowed is False
 
 
 def test_budget_paid_services_enabled_requires_explicit_approval(base_config_dict, tmp_path):

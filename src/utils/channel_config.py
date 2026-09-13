@@ -46,7 +46,12 @@ class BudgetSettings(_StrictModel):
     default_incremental_budget_usd: Literal[0]
     emergency_monthly_ceiling_usd: Literal[25]
     paid_services_enabled: bool
-    automatic_payment_allowed: bool
+    # Critical invariant: no code path may ever make an automatic payment —
+    # every paid spend requires a human-approved paid-proposal record (see
+    # docs/spec-v4/schemas/paid-proposal.schema.json). Locked to False at
+    # the type level (not just a default), so a config that sets this to
+    # true fails to load at all rather than silently being accepted.
+    automatic_payment_allowed: Literal[False]
     explicit_user_approval_required: bool
 
     @model_validator(mode="after")
@@ -82,6 +87,18 @@ class CharacterSettings(_StrictModel):
 
 
 class ChannelPolicy(_StrictModel):
+    """Root policy document, one-to-one with config/channel-config.yaml's
+    top-level sections.
+
+    Callers must treat the object returned by get_channel_policy() as
+    read-only. Pydantic models are mutable by default, but get_channel_policy()
+    is lru_cache-wrapped: every caller in the process receives the *same*
+    instance, not a copy, so mutating a field in place would corrupt the
+    cache for everyone else. If a caller needs a modified view, copy it
+    first — e.g. `policy.model_copy(deep=True)` — rather than assigning
+    into an existing instance's fields.
+    """
+
     channel: ChannelSettings
     budget: BudgetSettings
     motion: MotionSettings
@@ -95,11 +112,19 @@ def load_channel_policy(path: Path) -> ChannelPolicy:
     """Uncached: parse + validate one YAML file. Exists separately from
     get_channel_policy() so tests can point it at a temp-dir copy without
     touching the real config or the module-level cache."""
-    if not path.exists():
-        raise ChannelConfigError(f"channel config not found at {path}")
+    try:
+        text = path.read_text()
+    except FileNotFoundError as exc:
+        raise ChannelConfigError(f"channel config not found at {path}") from exc
+    except PermissionError as exc:
+        raise ChannelConfigError(f"permission denied reading channel config at {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise ChannelConfigError(f"channel config at {path} is not valid UTF-8 text: {exc}") from exc
+    except OSError as exc:
+        raise ChannelConfigError(f"could not read channel config at {path}: {exc}") from exc
 
     try:
-        raw = yaml.safe_load(path.read_text())
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ChannelConfigError(f"invalid YAML in {path}: {exc}") from exc
 
@@ -117,7 +142,9 @@ def load_channel_policy(path: Path) -> ChannelPolicy:
 @lru_cache
 def get_channel_policy() -> ChannelPolicy:
     """Cached accessor for config/channel-config.yaml — parsed/validated
-    once per process. Not yet called from any provider, renderer, or CLI
-    command (see src/utils/config.py's get_runtime_config() for the one
-    Phase 1B integration point)."""
+    once per process. The returned ChannelPolicy is shared by every caller
+    (lru_cache returns the same instance, not a copy) — treat it as
+    read-only, see the ChannelPolicy docstring. Not yet called from any
+    provider, renderer, or CLI command (see src/utils/config.py's
+    get_runtime_config() for the one Phase 1B integration point)."""
     return load_channel_policy(CHANNEL_CONFIG_PATH)
