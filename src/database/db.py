@@ -20,6 +20,41 @@ CREATE TABLE IF NOT EXISTS jobs (
     output_path  TEXT,
     error        TEXT
 );
+
+-- Phase 1D: local project lifecycle registry — see
+-- src/core/project_state_machine.py (transition rules) and
+-- src/database/project_repository.py (this schema's read/write API).
+-- Additive only: the jobs table above is untouched.
+CREATE TABLE IF NOT EXISTS projects (
+    project_id             TEXT PRIMARY KEY,
+    manifest_path          TEXT NOT NULL,
+    manifest_fingerprint   TEXT NOT NULL,
+    current_stage          TEXT NOT NULL,
+    last_successful_stage  TEXT NOT NULL,
+    failed_stage           TEXT,
+    failure_message        TEXT,
+    lifecycle_version      INTEGER NOT NULL,
+    created_at             TEXT NOT NULL,
+    updated_at             TEXT NOT NULL,
+    completed_at           TEXT,
+    archived_at            TEXT,
+    retry_count            INTEGER NOT NULL DEFAULT 0,
+    execution_status       TEXT NOT NULL
+);
+
+-- Append-only audit trail of every stage change. transition_id's
+-- autoincrement order is the deterministic chronological/event order
+-- list_project_transitions() reads back in.
+CREATE TABLE IF NOT EXISTS project_transitions (
+    transition_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id         TEXT NOT NULL REFERENCES projects (project_id),
+    from_stage         TEXT NOT NULL,
+    to_stage           TEXT NOT NULL,
+    occurred_at        TEXT NOT NULL,
+    reason             TEXT,
+    is_retry           INTEGER NOT NULL,
+    lifecycle_version  INTEGER NOT NULL
+);
 """
 
 
