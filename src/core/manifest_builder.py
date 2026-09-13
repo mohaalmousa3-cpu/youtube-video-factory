@@ -88,21 +88,68 @@ def _build_policy_snapshot(channel_policy: ChannelPolicy) -> PolicySnapshot:
     )
 
 
+# The fingerprint (and therefore project_id) must represent a video's
+# CONTENT-PRODUCTION identity only — not the channel's current operational
+# spending posture. These nine fields describe *what the video is and how
+# it may be produced* (language, Flow/Veo/music/timing/overlay/identity
+# rules); changing any of them really does describe a different planned
+# video, so they participate in the fingerprint.
+_FINGERPRINT_POLICY_FIELDS = (
+    "language",
+    "viewer_facing_language",
+    "manual_flow_required",
+    "require_local_fallback_for_manual_flow",
+    "veo_api_enabled",
+    "background_music_enabled",
+    "final_timing_source",
+    "deterministic_text_overlays_enabled",
+    "identity_locked_across_channel",
+)
+
+# By contrast, these five fields are governance/spend CONTROLS, not
+# content: default_incremental_budget_usd, emergency_monthly_ceiling_usd,
+# paid_services_enabled, automatic_payment_allowed, and
+# explicit_user_approval_required can all change over time (e.g. a
+# paid-proposal being approved — see Phase 1E in
+# docs/spec-v4/IMPLEMENTATION-PLAN.md) without the underlying video being a
+# different video. They are deliberately EXCLUDED from
+# _FINGERPRINT_POLICY_FIELDS/_fingerprint_policy_payload() below, even
+# though the full PolicySnapshot (all fourteen fields, governance included)
+# is still stored on VideoManifest.policy_snapshot as an audit record of
+# what the channel's policy was at build time.
+
+
 def _canonical_json(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def _fingerprint_policy_payload(policy_snapshot: PolicySnapshot) -> dict:
+    """The content-production subset of PolicySnapshot used for
+    fingerprinting — never the full snapshot. Exposed as its own function
+    (rather than inlined into _compute_fingerprint) so it can be tested in
+    isolation against hand-built PolicySnapshot values, including ones a
+    real, validated ChannelPolicy could never actually produce (e.g.
+    automatic_payment_allowed=True) — proving a governance field's
+    exclusion this way never requires weakening build_video_manifest()'s
+    own safety gate, which continues to reject such a ChannelPolicy
+    outright before fingerprinting is ever reached."""
+    dumped = policy_snapshot.model_dump(mode="json")
+    return {field: dumped[field] for field in _FINGERPRINT_POLICY_FIELDS}
 
 
 def _compute_fingerprint(
     story_input: StoryInput, scene_plan: ScenePlan, policy_snapshot: PolicySnapshot
 ) -> str:
     """SHA-256 of the canonical JSON of (story_input, scene_plan,
-    policy_snapshot). Deliberately excludes created_at: two builds of the
-    identical content at different times must fingerprint identically, and
-    two builds of different content at the same instant must not."""
+    fingerprint_policy_payload). Deliberately excludes created_at (two
+    builds of identical content at different times must fingerprint
+    identically) and the governance/spend subset of policy_snapshot (see
+    _fingerprint_policy_payload and _FINGERPRINT_POLICY_FIELDS above) —
+    only content-production fields participate in a video's identity."""
     payload = {
         "story_input": story_input.model_dump(mode="json"),
         "scene_plan": scene_plan.model_dump(mode="json"),
-        "policy_snapshot": policy_snapshot.model_dump(mode="json"),
+        "policy_snapshot": _fingerprint_policy_payload(policy_snapshot),
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 

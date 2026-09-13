@@ -10,7 +10,21 @@ real ChannelPolicy instance. build_video_manifest() only ever accesses
 channel_policy's attributes — it never isinstance()-checks it — so a fake
 with the right attribute shape exercises the SAME code path a real,
 somehow-misconfigured ChannelPolicy would. This does not touch
-src/utils/channel_config.py or weaken any of its real invariants."""
+src/utils/channel_config.py or weaken any of its real invariants.
+
+The fingerprint/project_id represents a video's CONTENT-PRODUCTION
+identity, not the channel's operational spending posture — see
+manifest_builder.py's _FINGERPRINT_POLICY_FIELDS. Tests below prove content
+fields DO affect the fingerprint and governance/spend fields do NOT.
+Governance fields are tested two ways: the ones safe to vary on a real,
+fully-valid ChannelPolicy (e.g. paid_services_enabled) are proven via a
+real, end-to-end build_video_manifest() call; automatic_payment_allowed is
+NOT safe to vary that way (build_video_manifest() must keep rejecting it —
+see test_builder_rejects_automatic_payment_allowed below, unchanged) so its
+exclusion is instead proven directly against the pure
+_fingerprint_policy_payload() helper with a hand-built PolicySnapshot —
+PolicySnapshot itself has no Literal locks, so this needs no fake at all.
+This never weakens or bypasses build_video_manifest()'s own safety gate."""
 import copy
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -18,7 +32,12 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from src.core.manifest_builder import ManifestValidationError, build_video_manifest
+from src.core.manifest_builder import (
+    ManifestValidationError,
+    _fingerprint_policy_payload,
+    build_video_manifest,
+)
+from src.models.manifest import PolicySnapshot
 from src.utils.channel_config import CHANNEL_CONFIG_PATH, load_channel_policy
 
 
@@ -87,6 +106,32 @@ def _valid_scene_plan(**overrides) -> dict:
     data = dict(scenes=(_valid_scene(),), role_outfits=())
     data.update(overrides)
     return data
+
+
+def _valid_policy_snapshot(**overrides) -> PolicySnapshot:
+    """A hand-built, valid-by-construction PolicySnapshot. Unlike
+    ChannelPolicy, PolicySnapshot itself has no Literal locks (it's a
+    plain audit-record copy — see its docstring), so every field,
+    including the governance ones, can be freely overridden here without
+    any fake/duck-typing trick."""
+    data = dict(
+        language="en-US",
+        viewer_facing_language="English",
+        default_incremental_budget_usd=0,
+        emergency_monthly_ceiling_usd=25,
+        paid_services_enabled=False,
+        automatic_payment_allowed=False,
+        explicit_user_approval_required=True,
+        manual_flow_required=False,
+        require_local_fallback_for_manual_flow=True,
+        veo_api_enabled=False,
+        background_music_enabled=False,
+        final_timing_source="measured_audio",
+        deterministic_text_overlays_enabled=True,
+        identity_locked_across_channel=True,
+    )
+    data.update(overrides)
+    return PolicySnapshot.model_validate(data)
 
 
 # ---------------------------------------------------------------------
@@ -169,10 +214,15 @@ def test_changed_scene_narration_changes_fingerprint():
     assert baseline.source_fingerprint != changed.source_fingerprint
 
 
-def test_changed_policy_snapshot_field_changes_fingerprint(tmp_path):
-    """Two REAL, independently valid ChannelPolicy instances that differ
-    in exactly one non-locked field (budget.paid_services_enabled) must
-    produce different fingerprints for identical story/scene input."""
+def test_changed_governance_policy_field_does_not_change_fingerprint(tmp_path):
+    """Two REAL, independently valid ChannelPolicy instances that differ in
+    exactly one GOVERNANCE field (budget.paid_services_enabled — safe to
+    vary, doesn't trip any safety gate) must still produce the SAME
+    fingerprint for identical story/scene input: the channel's spending
+    posture is not part of a video's content identity (see
+    manifest_builder.py's _FINGERPRINT_POLICY_FIELDS). This replaces a
+    prior version of this test that (incorrectly, per review) expected the
+    fingerprint to change here."""
     with open(CHANNEL_CONFIG_PATH) as f:
         base_config = yaml.safe_load(f)
 
@@ -193,7 +243,69 @@ def test_changed_policy_snapshot_field_changes_fingerprint(tmp_path):
     manifest_b = build_video_manifest(
         _valid_story_input(), _valid_scene_plan(), policy_b, created_at=FIXED_CREATED_AT
     )
-    assert manifest_a.source_fingerprint != manifest_b.source_fingerprint
+    assert manifest_a.source_fingerprint == manifest_b.source_fingerprint
+    assert manifest_a.project_id == manifest_b.project_id
+    # The full audit-record snapshot still reflects the real difference.
+    assert manifest_a.policy_snapshot.paid_services_enabled != manifest_b.policy_snapshot.paid_services_enabled
+
+
+# ---------------------------------------------------------------------
+# _fingerprint_policy_payload(): the pure content/governance split,
+# tested directly against hand-built PolicySnapshot values. This is what
+# proves automatic_payment_allowed's exclusion without ever needing to
+# construct a ChannelPolicy that allows it (impossible by design — Phase
+# 1B locks it to Literal[False]) or weaken build_video_manifest()'s own
+# safety gate (still tested unchanged below, e.g.
+# test_builder_rejects_automatic_payment_allowed).
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("language", "en-GB"),
+        ("viewer_facing_language", "British English"),
+        ("manual_flow_required", True),
+        ("require_local_fallback_for_manual_flow", False),
+        ("veo_api_enabled", True),
+        ("background_music_enabled", True),
+        ("final_timing_source", "estimated_wpm"),
+        ("deterministic_text_overlays_enabled", False),
+        ("identity_locked_across_channel", False),
+    ],
+)
+def test_fingerprint_payload_changes_when_content_field_changes(field, value):
+    baseline = _fingerprint_policy_payload(_valid_policy_snapshot())
+    changed = _fingerprint_policy_payload(_valid_policy_snapshot(**{field: value}))
+    assert baseline != changed
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("default_incremental_budget_usd", 10),
+        ("emergency_monthly_ceiling_usd", 100),
+        ("paid_services_enabled", True),
+        ("automatic_payment_allowed", True),
+        ("explicit_user_approval_required", False),
+    ],
+)
+def test_fingerprint_payload_unchanged_when_governance_field_changes(field, value):
+    baseline = _fingerprint_policy_payload(_valid_policy_snapshot())
+    changed = _fingerprint_policy_payload(_valid_policy_snapshot(**{field: value}))
+    assert baseline == changed
+
+
+def test_fingerprint_payload_excludes_governance_keys_entirely():
+    payload = _fingerprint_policy_payload(_valid_policy_snapshot())
+    for governance_field in (
+        "default_incremental_budget_usd",
+        "emergency_monthly_ceiling_usd",
+        "paid_services_enabled",
+        "automatic_payment_allowed",
+        "explicit_user_approval_required",
+    ):
+        assert governance_field not in payload
 
 
 # ---------------------------------------------------------------------

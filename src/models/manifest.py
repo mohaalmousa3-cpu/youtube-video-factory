@@ -25,7 +25,15 @@ class PolicySnapshot(FrozenStrictModel):
     in effect when this manifest was built — deliberately not the live
     ChannelPolicy object, so a saved manifest never holds a reference to
     (or drifts out of sync with) config/channel-config.yaml after the
-    fact."""
+    fact.
+
+    This full snapshot (all fields below, including budget/governance) is
+    kept purely as an audit record of what the policy was at build time.
+    It is NOT what VideoManifest's fingerprint is computed from — the
+    fingerprint uses only a content-production subset of these fields
+    (excluding the budget/governance ones, which can change over time
+    without the underlying video becoming a different video); see
+    src/core/manifest_builder.py's _fingerprint_policy_payload()."""
 
     language: str
     viewer_facing_language: str
