@@ -3,6 +3,7 @@ creation, and all-or-nothing queue import. No network, no provider — all
 inputs are local JSON fixtures written to tmp_path."""
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from src.core.queue_import import (
     InputFileError,
     ProjectCreationError,
     QueueImportError,
+    _resolve_within,
     create_project_from_inputs,
     import_queue,
     load_queue_import,
@@ -307,6 +309,87 @@ def test_create_project_from_inputs_cleans_up_manifest_on_db_failure(tmp_path, c
     assert not (project_dir / "manifest.json").exists()
     assert not project_dir.exists()  # freshly-created directory was cleaned up too
     assert get_project(conn, manifest.project_id) is None
+
+
+def test_create_project_from_inputs_with_relative_output_root(tmp_path, conn, monkeypatch):
+    """The same _resolve_within() safety check create_project_from_inputs
+    now applies to --output-root must work correctly for a RELATIVE
+    output_root too, not just an already-absolute tmp_path-based one."""
+    from src.models.story import StoryInput
+    from src.models.scene import ScenePlan
+
+    monkeypatch.chdir(tmp_path)
+    story = StoryInput.model_validate(_story_input_dict())
+    scenes = ScenePlan.model_validate(_scene_plan_dict())
+    relative_output_root = Path("projects")  # relative to the new cwd (tmp_path)
+
+    project = create_project_from_inputs(conn, story, scenes, get_channel_policy(), relative_output_root)
+
+    resolved_manifest_path = (tmp_path / "projects" / project.project_id / "manifest.json").resolve()
+    assert resolved_manifest_path.exists()
+    assert resolved_manifest_path.read_text()  # a real, non-empty manifest was written there
+
+
+def test_create_project_from_inputs_rejects_project_id_that_would_escape_output_root(tmp_path, conn, monkeypatch):
+    """Even though build_video_manifest never actually produces a
+    project_id containing path-traversal characters (it's always
+    "proj-" + a hex fingerprint prefix), create_project_from_inputs must
+    still refuse to write outside --output-root if it ever did — this
+    proves the unified _resolve_within() check is actually wired into
+    this call site, not just present in the module."""
+    from src.models.story import StoryInput
+    from src.models.scene import ScenePlan
+    from src.core.manifest_builder import build_video_manifest as real_build_video_manifest
+
+    story = StoryInput.model_validate(_story_input_dict())
+    scenes = ScenePlan.model_validate(_scene_plan_dict())
+    output_root = tmp_path / "projects"
+
+    real_manifest = real_build_video_manifest(story, scenes, get_channel_policy())
+    malicious_manifest = real_manifest.model_copy(update={"project_id": "../escape"})
+    monkeypatch.setattr(
+        "src.core.queue_import.build_video_manifest", lambda *args, **kwargs: malicious_manifest
+    )
+
+    with pytest.raises(ProjectCreationError):
+        create_project_from_inputs(conn, story, scenes, get_channel_policy(), output_root)
+
+    # Nothing was written anywhere, inside or outside output_root.
+    assert not output_root.exists()
+    assert not (tmp_path / "escape").exists()
+
+
+# ---------------------------------------------------------------------
+# _resolve_within: the one shared path-safety helper, tested directly
+# ---------------------------------------------------------------------
+
+
+def test_resolve_within_accepts_a_safe_relative_path(tmp_path):
+    base_dir = tmp_path / "root"
+    base_dir.mkdir()
+
+    result = _resolve_within(base_dir, "proj-abc123", what="test path")
+
+    assert result == (base_dir / "proj-abc123").resolve()
+
+
+def test_resolve_within_rejects_traversal_with_default_error(tmp_path):
+    base_dir = tmp_path / "root"
+    base_dir.mkdir()
+
+    with pytest.raises(QueueImportError):
+        _resolve_within(base_dir, "../escape", what="test path")
+
+
+def test_resolve_within_rejects_traversal_with_custom_error_cls(tmp_path):
+    """Proves the helper's error_cls parameter is real, not decorative —
+    create_project_from_inputs relies on this to raise ProjectCreationError
+    (not QueueImportError) for its own --output-root check."""
+    base_dir = tmp_path / "root"
+    base_dir.mkdir()
+
+    with pytest.raises(ProjectCreationError):
+        _resolve_within(base_dir, "../escape", what="test path", error_cls=ProjectCreationError)
 
 
 # ---------------------------------------------------------------------

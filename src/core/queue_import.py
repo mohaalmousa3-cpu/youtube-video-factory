@@ -146,16 +146,33 @@ def load_queue_import(path: Path) -> QueueImport:
 # ---------------------------------------------------------------------
 
 
-def _resolve_within(base_dir: Path, raw_path: str, *, what: str) -> Path:
+def _resolve_within(
+    base_dir: Path,
+    raw_path: str,
+    *,
+    what: str,
+    error_cls: type[Exception] = QueueImportError,
+) -> Path:
     """Resolve `raw_path` relative to `base_dir` and reject it if the
     resolved path escapes `base_dir` (via `../`, an absolute path, or a
-    symlink) — no override exists in Phase 1E to opt out of this check."""
+    symlink) — no override exists in Phase 1E to opt out of this check.
+
+    This is the ONE path-safety helper for every "does this stay inside
+    that directory" check in this module: queue item story_input_path/
+    scene_plan_path against the queue file's own directory,
+    output_subdirectory against --output-root, AND the default
+    <output-root>/<project_id> directory a single create-project call
+    uses — the latter two both call this with `error_cls=ProjectCreationError`
+    or the default `QueueImportError` as appropriate to the caller, so a
+    single-project create and a queue import apply exactly the same
+    resolve-and-check logic to --output-root, not two independently
+    written (and possibly inconsistent) checks."""
     base_resolved = base_dir.resolve()
     candidate = (base_dir / raw_path).resolve()
     try:
         candidate.relative_to(base_resolved)
     except ValueError as exc:
-        raise QueueImportError(
+        raise error_cls(
             f"{what} {raw_path!r} resolves to {candidate}, which is outside "
             f"{base_resolved} — this is not allowed"
         ) from exc
@@ -187,7 +204,13 @@ def create_project_from_inputs(
     module's docstring)."""
     manifest = build_video_manifest(story_input, scene_plan, channel_policy, created_at=now)
 
-    manifest_path = output_root / manifest.project_id / "manifest.json"
+    manifest_dir = _resolve_within(
+        output_root,
+        manifest.project_id,
+        what="output_root/project_id directory",
+        error_cls=ProjectCreationError,
+    )
+    manifest_path = manifest_dir / "manifest.json"
     if manifest_path.exists():
         raise ProjectCreationError(
             f"manifest already exists at {manifest_path} — refusing to overwrite"
@@ -330,13 +353,21 @@ def prepare_queue_import(
                 f"{manifest.project_id!r}, which already exists in the database"
             )
 
-        subdirectory = item.output_subdirectory
-        if subdirectory is not None:
-            manifest_dir = _resolve_within(
-                output_root, subdirectory, what=f"queue item {item.queue_item_id!r} output_subdirectory"
-            )
-        else:
-            manifest_dir = output_root.resolve() / manifest.project_id
+        # The default (no explicit output_subdirectory) and the explicit
+        # override both go through the SAME _resolve_within() check against
+        # --output-root — one path-safety mechanism, not two independently
+        # written ones. project_id can never actually contain `../` or an
+        # absolute path (it's always "proj-" + a hex fingerprint prefix),
+        # so the default branch was never exploitable, but it now applies
+        # the identical resolve-and-check logic as the explicit-override
+        # branch and as create_project_from_inputs's single-project path,
+        # for one auditable mechanism instead of two.
+        subdirectory = item.output_subdirectory if item.output_subdirectory is not None else manifest.project_id
+        manifest_dir = _resolve_within(
+            output_root,
+            subdirectory,
+            what=f"queue item {item.queue_item_id!r} output directory",
+        )
         manifest_path = manifest_dir / "manifest.json"
 
         if manifest_path.exists():
