@@ -257,6 +257,26 @@ def test_failure_from_audio_pending_records_correctly():
     assert transition.to_stage == "failed"
 
 
+def test_planned_cannot_be_marked_failed():
+    """"planned" means a valid, approved manifest exists — a registry
+    fact, not an in-progress execution stage — so there is nothing
+    in-flight to fail. Only actual execution stages (audio_pending,
+    visuals_pending, animation_pending, render_pending, qc_pending,
+    ready_for_manual_publish) are fail-able."""
+    project = _initial_project()
+
+    with pytest.raises(ProjectStateTransitionError):
+        mark_project_failed(project, "planned", "should be rejected", now=FIXED_NOW)
+
+    # The rejected call left the project completely unchanged.
+    unchanged = _initial_project()
+    assert project == unchanged
+    assert project.current_stage == "planned"
+    assert project.failed_stage is None
+    assert project.failure_message is None
+    assert project.lifecycle_version == 1
+
+
 def test_mark_project_failed_rejects_mismatched_failed_stage():
     project = _initial_project()
     project = _advance(project, "audio_pending")

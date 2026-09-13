@@ -24,9 +24,12 @@ for the full write-up):
   (_VERIFICATION_REQUIRED_STAGES) can only be reached with transition_project's
   verified=True — Phase 1D itself never passes verified=True in any
   non-test code path; only a future artifact-verification stage should.
-- Only stages representing in-progress/attempted work (_FAILABLE_STAGES) can
-  fail; an already-verified "_ready"/"rendered"/"qc_passed"/"completed"
-  stage cannot (there is deliberately no "unverify" operation in Phase 1D).
+- Only stages representing in-progress/attempted execution work
+  (_FAILABLE_STAGES) can fail. "planned" cannot: it means a valid, approved
+  manifest exists — a registry/bookkeeping fact, not an attempted execution
+  step, so there is nothing in-flight to fail. An already-verified
+  "_ready"/"rendered"/"qc_passed"/"completed" stage cannot fail either
+  (there is deliberately no "unverify" operation in Phase 1D).
 - "archived" is reachable (with an explicit reason) from any non-archived
   state, including "completed" and "failed" — an administrative closure
   action, distinct from the production pipeline's forward/retry rules —
@@ -104,14 +107,16 @@ _VERIFICATION_REQUIRED_STAGES = frozenset(
     }
 )
 
-# Only a stage representing in-progress/attempted work can fail. A
+# Only a stage representing in-progress/attempted execution work can fail.
+# "planned" is deliberately excluded: it means "a valid, approved manifest
+# exists" — a registry/bookkeeping fact, not an attempted execution step,
+# so there is nothing in-flight to fail. A
 # "_ready"/"rendered"/"qc_passed"/"completed" stage represents an
 # already-verified fact — Phase 1D has no "unverify" operation, so those
-# stages are deliberately excluded here (disjoint from
-# _VERIFICATION_REQUIRED_STAGES by construction).
+# stages are also excluded here (disjoint from _VERIFICATION_REQUIRED_STAGES
+# by construction).
 _FAILABLE_STAGES = frozenset(
     {
-        "planned",
         "audio_pending",
         "visuals_pending",
         "animation_pending",
