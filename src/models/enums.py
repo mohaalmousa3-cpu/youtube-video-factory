@@ -30,3 +30,10 @@ ManifestLifecycleState = Literal["planned", "in_production", "complete", "archiv
 
 # Phase 1C only ever produces "not_executed" — no provider has run.
 ExecutionStatus = Literal["not_executed"]
+
+# Phase 2B: what kind of local file one ArtifactRecord (src/models/artifact.py)
+# describes. "audio", "visual", and "animation" are scene-level (one per
+# scene, e.g. one scene's narration WAV or generated image); "render" and
+# "qc_report" are project-level (one per whole video) — see
+# src/models/artifact.py's SCENE_LEVEL_ARTIFACT_KINDS / PROJECT_LEVEL_ARTIFACT_KINDS.
+ArtifactKind = Literal["audio", "visual", "animation", "render", "qc_report"]
