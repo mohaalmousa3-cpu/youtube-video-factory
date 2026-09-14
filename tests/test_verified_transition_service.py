@@ -244,8 +244,12 @@ def test_verify_and_advance_full_pipeline_fail_then_succeed_at_each_checkpoint(i
         assert result.approved is False
         assert any("qc_report" in r for r in result.reasons)
 
+        # Phase 2H: qc_passed additionally requires the verified qc_report
+        # FILE's own JSON to say passed=true — this real round trip proves
+        # a genuine passed:true report satisfies that gate end to end.
         _write_and_register(
-            conn, project_id, project_dir, "qc_report", None, "qc/report.json", artifact_id="qc-report-final"
+            conn, project_id, project_dir, "qc_report", None, "qc/report.json", artifact_id="qc-report-final",
+            content=b'{"passed": true}',
         )
         result = verify_and_advance(
             conn, project, manifest, list_artifacts_by_project(conn, project_id), "qc_passed", "QC review passed"
@@ -711,3 +715,132 @@ def test_supported_target_stages_matches_spec_exactly():
         "qc_passed",
         "completed",
     }
+
+
+# ---------------------------------------------------------------------
+# Phase 2H: qc_passed-only semantic gate on the verified qc_report file
+# ---------------------------------------------------------------------
+
+
+def _project_at_qc_pending_with_render(conn, project_id, project_dir):
+    """Fast-forward a project straight to qc_pending with a render
+    artifact already registered. verify_and_advance() only ever checks
+    the CURRENT target stage's own requirement, never earlier stages', so
+    no audio/visual/animation artifacts need to exist for these tests —
+    only the render half of qc_passed's two-artifact requirement, plus
+    whatever qc_report each test registers itself."""
+    project = get_project(conn, project_id)
+    for stage, verified in [
+        ("audio_pending", False), ("audio_ready", True),
+        ("visuals_pending", False), ("visuals_ready", True),
+        ("animation_pending", False), ("animation_ready", True),
+        ("render_pending", False), ("rendered", True),
+        ("qc_pending", False),
+    ]:
+        updated, transition = transition_project(project, stage, now=FIXED_NOW, verified=verified)
+        save_transition(conn, project.lifecycle_version, updated, transition)
+        project = get_project(conn, project_id)
+    _write_and_register(conn, project_id, project_dir, "render", None, "render/final.mp4", artifact_id="render-final")
+    return project
+
+
+def test_qc_passed_rejects_report_with_passed_false_and_writes_nothing(isolated_db):
+    """A structurally valid, checksum-matching qc_report saying
+    passed:false is real, registered data — but must never by itself
+    satisfy qc_passed."""
+    project_id, project_dir, manifest = _create_registered_project(isolated_db / "projects")
+    conn = _get_conn()
+    try:
+        project = _project_at_qc_pending_with_render(conn, project_id, project_dir)
+        _write_and_register(
+            conn, project_id, project_dir, "qc_report", None, "qc/report.json", artifact_id="qc-report-final",
+            content=b'{"passed": false}',
+        )
+        before = get_project(conn, project_id)
+        before_transitions = list_project_transitions(conn, project_id)
+
+        result = verify_and_advance(
+            conn, project, manifest, list_artifacts_by_project(conn, project_id), "qc_passed", "QC review"
+        )
+
+        assert result.approved is False
+        assert result.db_committed is False
+        assert any("passed=false" in r for r in result.reasons)
+        assert get_project(conn, project_id) == before  # zero DB write
+        assert list_project_transitions(conn, project_id) == before_transitions
+    finally:
+        conn.close()
+
+
+def test_qc_passed_tampered_report_fails_checksum_before_semantic_parsing(isolated_db):
+    """The report is registered as passed:true (so IF semantic parsing
+    were reached, it would pass), but its on-disk bytes are changed
+    afterward to different-but-still-valid passed:true JSON — a different
+    checksum either way. The rejection reason must be the structural
+    checksum mismatch, never a semantic 'passed' message, proving
+    structural verification runs (and can reject) before semantic parsing
+    is ever attempted."""
+    project_id, project_dir, manifest = _create_registered_project(isolated_db / "projects")
+    conn = _get_conn()
+    try:
+        project = _project_at_qc_pending_with_render(conn, project_id, project_dir)
+        _write_and_register(
+            conn, project_id, project_dir, "qc_report", None, "qc/report.json", artifact_id="qc-report-final",
+            content=b'{"passed": true}',
+        )
+        # Tamper with the file after registration — still valid,
+        # still-true JSON, just different bytes than what was registered.
+        (project_dir / "qc" / "report.json").write_bytes(b'{"passed": true, "note": "tampered"}')
+
+        result = verify_and_advance(
+            conn, project, manifest, list_artifacts_by_project(conn, project_id), "qc_passed", "QC review"
+        )
+
+        assert result.approved is False
+        assert result.db_committed is False
+        assert any("checksum mismatch" in r for r in result.reasons)
+        assert not any("passed=false" in r for r in result.reasons)
+    finally:
+        conn.close()
+
+
+def test_qc_passed_missing_qc_report_still_rejects_with_render_present(isolated_db):
+    """Regression check: render alone (Phase 2G's own requirement) must
+    still be insufficient for qc_passed without any qc_report at all —
+    unchanged, pre-existing behavior, not new."""
+    project_id, project_dir, manifest = _create_registered_project(isolated_db / "projects")
+    conn = _get_conn()
+    try:
+        project = _project_at_qc_pending_with_render(conn, project_id, project_dir)
+
+        result = verify_and_advance(
+            conn, project, manifest, list_artifacts_by_project(conn, project_id), "qc_passed", "QC review"
+        )
+
+        assert result.approved is False
+        assert result.db_committed is False
+        assert any("qc_report" in r for r in result.reasons)
+    finally:
+        conn.close()
+
+
+def test_qc_passed_accepts_report_with_passed_true(isolated_db):
+    project_id, project_dir, manifest = _create_registered_project(isolated_db / "projects")
+    conn = _get_conn()
+    try:
+        project = _project_at_qc_pending_with_render(conn, project_id, project_dir)
+        _write_and_register(
+            conn, project_id, project_dir, "qc_report", None, "qc/report.json", artifact_id="qc-report-final",
+            content=b'{"passed": true}',
+        )
+
+        result = verify_and_advance(
+            conn, project, manifest, list_artifacts_by_project(conn, project_id), "qc_passed", "QC review"
+        )
+
+        assert result.approved is True
+        assert result.db_committed is True
+        project = get_project(conn, project_id)
+        assert project.current_stage == "qc_passed"
+    finally:
+        conn.close()

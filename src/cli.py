@@ -45,7 +45,18 @@ THE project's one MP4 "render" artifact — project-level, not per-scene
 forbids a scene_id for kind="render"), same ffprobe duration+video-stream
 validation as `register-animation-artifact`, never validated against
 manifest.target_duration_seconds — only the measured value is ever
-recorded. None of the new
+recorded. Phase 2H adds `register-qc-report-artifact`
+(src/core/qc_report_artifact_registrar.py) for THE project's one JSON
+"qc_report" artifact — project-level like `register-render-artifact`,
+requiring only a well-formed JSON object with a boolean `passed` field
+(either value registers successfully; a false report is retained audit
+data, not an error). Phase 2H also makes one targeted addition to
+src/core/verified_transition_service.py: only for to_stage=="qc_passed",
+after existing structural verification of both the render and qc_report
+artifacts already passed, it additionally re-reads the verified qc_report
+FILE (never the mutable ArtifactRecord.metadata) and requires its
+`passed` to be strictly True before the transition is allowed — every
+other target stage is unaffected. None of the new
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`,
 `register-animation-artifact`, and `register-render-artifact` use a
@@ -998,6 +1009,97 @@ def cmd_register_render_artifact(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _render_register_qc_report_artifact_text(result) -> str:
+    status = "OK" if result.ok else "FAILED"
+    idempotent_note = " (idempotent no-op — nothing was written)" if result.idempotent else ""
+    lines = [
+        f"register-qc-report-artifact: {status}{idempotent_note} "
+        "(writes exactly one artifact row on a fresh registration; the manifest and "
+        "project lifecycle stage are never touched — passed:false is registered, not rejected; "
+        "only verify-and-advance(to=qc_passed) gates on it)",
+        f"project_id: {result.project_id}",
+        f"artifact_id: {result.artifact_id}",
+        f"relative_path: {result.relative_path}",
+        f"copied: {result.copied}",
+        f"passed: {result.passed}",
+    ]
+    for reason in result.reasons:
+        lines.append(f"  - {reason}")
+    return "\n".join(lines)
+
+
+def cmd_register_qc_report_artifact(args: argparse.Namespace) -> int:
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.qc_report_artifact_registrar import (
+        QcReportArtifactRegistrationError,
+        register_qc_report_artifact,
+    )
+    from src.database.db import get_existing_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"register-qc-report-artifact: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Never calls init_db(): a missing data directory or database file
+    # must fail cleanly here, not be created — same contract as
+    # verify-and-advance's/the three prior register-*-artifact commands'
+    # get_existing_connection().
+    try:
+        conn = get_existing_connection()
+    except sqlite3.Error as exc:
+        print(f"register-qc-report-artifact: FAILED — no local project database found: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            print(
+                f"register-qc-report-artifact: FAILED — no project found with project_id {args.project_id!r}",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            manifest = load_manifest(Path(project.manifest_path))
+        except ManifestStoreError as exc:
+            print(f"register-qc-report-artifact: FAILED — {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            result = register_qc_report_artifact(conn, project, manifest, Path(args.file))
+        except QcReportArtifactRegistrationError as exc:
+            print(f"register-qc-report-artifact: FAILED — {exc}", file=sys.stderr)
+            return 1
+    except sqlite3.Error as exc:
+        print(f"register-qc-report-artifact: FAILED — {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    if out_format == "json":
+        payload = {
+            "project_id": result.project_id,
+            "artifact_id": result.artifact_id,
+            "relative_path": result.relative_path,
+            "ok": result.ok,
+            "idempotent": result.idempotent,
+            "copied": result.copied,
+            "passed": result.passed,
+            "reasons": list(result.reasons),
+            "artifact": result.artifact.model_dump(mode="json") if result.artifact is not None else None,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_register_qc_report_artifact_text(result))
+
+    return 0 if result.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -1139,6 +1241,22 @@ def build_parser() -> argparse.ArgumentParser:
     register_render_artifact.add_argument("--file", required=True, help="Path to the local MP4 video to register")
     register_render_artifact.add_argument("--format", default="text", help="Output format: text (default) or json")
     register_render_artifact.set_defaults(func=cmd_register_render_artifact)
+
+    register_qc_report_artifact = sub.add_parser(
+        "register-qc-report-artifact",
+        help="Register a locally produced JSON QC report as this project's canonical qc_report "
+        "artifact (project-level, no --scene-id); passed:true or passed:false are both accepted and "
+        "registered — only verify-and-advance(to=qc_passed) gates on the value; writes to SQLite "
+        "(and copies the file) only on a fresh registration",
+    )
+    register_qc_report_artifact.add_argument("project_id")
+    register_qc_report_artifact.add_argument(
+        "--file", required=True, help="Path to the local QC report JSON file to register"
+    )
+    register_qc_report_artifact.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    register_qc_report_artifact.set_defaults(func=cmd_register_qc_report_artifact)
 
     return parser
 

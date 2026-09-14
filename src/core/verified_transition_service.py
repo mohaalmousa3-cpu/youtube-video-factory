@@ -24,14 +24,31 @@ returned VerifiedTransitionResult with approved=False (or
 db_committed=False) — this module does not raise for those. It raises
 VerifiedTransitionServiceError only for a caller/input inconsistency it
 will not silently work around (a manifest that does not belong to the
-given project)."""
+given project).
+
+Phase 2H addition — a targeted semantic gate, `to_stage == "qc_passed"`
+only: structural verification (existence/size/checksum/path-safety, via
+artifact_verifier.py, completely unchanged) proves a qc_report artifact's
+*file* matches what was registered; it says nothing about the report's
+content. A registered qc_report may legitimately say {"passed": false} —
+Phase 2H's registrar retains that as real audit data — but must never by
+itself be enough to reach qc_passed. So, only after every structural
+requirement (both "render" and "qc_report") has already passed, this
+module additionally reads the verified qc_report file (never
+ArtifactRecord.metadata, which is mutable DB state, not the source of
+truth) and requires its JSON to be an object with `passed` strictly
+`True`. Every other target stage (audio_ready, visuals_ready,
+animation_ready, rendered, completed) is completely unaffected — this
+check is gated strictly on to_stage == "qc_passed"."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 from src.core.artifact_verifier import verify_artifact
+from src.core.path_safety import resolve_under_project_dir
 from src.core.project_state_machine import ProjectStateTransitionError, transition_project
 from src.database.project_repository import ProjectConcurrencyError, save_transition
 from src.models.artifact import ArtifactRecord, ArtifactVerificationResult
@@ -86,6 +103,36 @@ def _matching(
     artifacts: tuple[ArtifactRecord, ...], kind: str, scene_id: str | None
 ) -> list[ArtifactRecord]:
     return [a for a in artifacts if a.kind == kind and a.scene_id == scene_id]
+
+
+def _qc_report_passed(path: Path | None) -> str | None:
+    """Read and parse the VERIFIED qc_report file at `path` (already
+    proven, by the structural check that runs before this is ever called,
+    to exist on disk with a checksum matching its registered
+    ArtifactRecord) and require its JSON to be an object with `passed`
+    strictly equal to boolean True. Returns None if it does; otherwise a
+    single, concise rejection reason string — never raises. `path` is
+    None only if the artifact's own relative_path somehow failed the
+    project-relative safety check (structurally already impossible to
+    reach here, since the structural loop above would already have
+    rejected it first — handled defensively anyway, not left to crash)."""
+    if path is None:
+        return "qc_report: relative_path is unsafe"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"qc_report: could not read verified report file at {path}: {exc}"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return f"qc_report: verified report file at {path} is not valid JSON: {exc}"
+    if not isinstance(data, dict):
+        return f"qc_report: verified report file at {path} must be a JSON object at the top level"
+    if "passed" not in data or not isinstance(data["passed"], bool):
+        return f"qc_report: verified report file at {path} must have a boolean 'passed' field"
+    if data["passed"] is not True:
+        return f"qc_report: verified report file at {path} records passed=false — QC did not pass"
+    return None
 
 
 def verify_and_advance(
@@ -168,6 +215,19 @@ def verify_and_advance(
         results.append(result)
         if not result.passed:
             reasons.extend(f"{matches[0].artifact_id}: {r}" for r in result.reasons)
+
+    # Phase 2H: qc_passed-only semantic gate — see module docstring.
+    # Structural verification (above) proves the qc_report FILE matches
+    # what was registered; it says nothing about its content. Only once
+    # every structural requirement (render AND qc_report) has already
+    # passed do we additionally require the verified report's own JSON to
+    # say passed=true — never falling back to ArtifactRecord.metadata.
+    if to_stage == "qc_passed" and not reasons:
+        qc_artifact = _matching(artifacts_tuple, "qc_report", None)[0]
+        resolved = resolve_under_project_dir(project_dir, qc_artifact.relative_path)
+        semantic_error = _qc_report_passed(resolved)
+        if semantic_error is not None:
+            reasons.append(semantic_error)
 
     if reasons:
         return _rejected(tuple(reasons), required=required, results=tuple(results))
