@@ -20,8 +20,10 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import get_args
 
 from src.database.db import init_db
+from src.models.enums import ArtifactKind
 from src.utils.logging import setup_logging
 
 
@@ -388,7 +390,10 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
-_ARTIFACT_KINDS = ("audio", "visual", "animation", "render", "qc_report")
+# Derived from the canonical src.models.enums.ArtifactKind Literal — not a
+# second, independently-maintained list of kinds. A new kind added there
+# is automatically a valid --kind choice here, with no second edit needed.
+_ARTIFACT_KINDS = get_args(ArtifactKind)
 
 
 def _render_verify_artifacts_text(project_id: str, kind: str | None, results) -> str:

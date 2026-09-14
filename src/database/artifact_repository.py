@@ -36,6 +36,21 @@ class DuplicateArtifactRegistrationError(Exception):
     identity — Phase 2B allows only one registration per that identity."""
 
 
+class ArtifactProjectNotFoundError(Exception):
+    """Raised by register_artifact() when record.project_id has no
+    matching row in the `projects` table — a foreign-key violation. This
+    is a different failure from a duplicate registration (the artifact
+    itself may be perfectly unique) and must never be reported as one."""
+
+
+class ArtifactRegistrationError(Exception):
+    """Raised by register_artifact() for any sqlite3.IntegrityError that
+    is neither an artifact_id collision, a (project, kind, scene, path)
+    identity collision, nor a foreign-key violation — e.g. a CHECK/NOT
+    NULL constraint failure. Wraps the underlying error rather than
+    mislabeling it as one of the more specific cases above."""
+
+
 _ARTIFACT_COLUMNS = (
     "artifact_id",
     "project_id",
@@ -78,11 +93,18 @@ def _row_to_record(row: sqlite3.Row) -> ArtifactRecord:
 
 
 def register_artifact(conn: sqlite3.Connection, record: ArtifactRecord) -> ArtifactRecord:
-    """Insert one new artifact row, atomically. Raises
-    ArtifactAlreadyExistsError if artifact_id is already registered, or
-    DuplicateArtifactRegistrationError if a different artifact_id already
-    registers the same (project_id, kind, scene_id, relative_path)
-    identity. No row is changed in either case."""
+    """Insert one new artifact row, atomically. Raises:
+    - ArtifactProjectNotFoundError if record.project_id has no matching
+      row in `projects` (a foreign-key violation) — checked first, since
+      this is a distinct failure from any duplicate below and must never
+      be reported as one;
+    - ArtifactAlreadyExistsError if artifact_id is already registered;
+    - DuplicateArtifactRegistrationError if a different artifact_id
+      already registers the same (project_id, kind, scene_id,
+      relative_path) identity;
+    - ArtifactRegistrationError for any other integrity failure (wraps
+      the underlying sqlite3.IntegrityError).
+    No row is changed in any case."""
     try:
         with conn:
             conn.execute(
@@ -91,14 +113,33 @@ def register_artifact(conn: sqlite3.Connection, record: ArtifactRecord) -> Artif
                 _record_to_row_params(record),
             )
     except sqlite3.IntegrityError as exc:
+        # sqlite3 exposes the precise constraint via sqlite_errorname
+        # (Python 3.11+) — e.g. SQLITE_CONSTRAINT_FOREIGNKEY vs
+        # SQLITE_CONSTRAINT_UNIQUE/_PRIMARYKEY. Checked first and on its
+        # own terms, so a missing parent project is never mistaken for a
+        # duplicate registration just because it also raises
+        # IntegrityError.
+        error_name = getattr(exc, "sqlite_errorname", None)
+        if error_name == "SQLITE_CONSTRAINT_FOREIGNKEY":
+            raise ArtifactProjectNotFoundError(
+                f"cannot register artifact {record.artifact_id!r}: project_id "
+                f"{record.project_id!r} is not registered in the local project registry"
+            ) from exc
+
         if get_artifact(conn, record.artifact_id) is not None:
             raise ArtifactAlreadyExistsError(
                 f"artifact_id {record.artifact_id!r} is already registered"
             ) from exc
-        raise DuplicateArtifactRegistrationError(
-            f"an artifact is already registered for project_id={record.project_id!r} "
-            f"kind={record.kind!r} scene_id={record.scene_id!r} "
-            f"relative_path={record.relative_path!r}"
+
+        if error_name == "SQLITE_CONSTRAINT_UNIQUE":
+            raise DuplicateArtifactRegistrationError(
+                f"an artifact is already registered for project_id={record.project_id!r} "
+                f"kind={record.kind!r} scene_id={record.scene_id!r} "
+                f"relative_path={record.relative_path!r}"
+            ) from exc
+
+        raise ArtifactRegistrationError(
+            f"could not register artifact {record.artifact_id!r}: {exc}"
         ) from exc
 
     return record

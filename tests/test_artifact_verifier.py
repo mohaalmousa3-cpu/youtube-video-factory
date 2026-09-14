@@ -219,6 +219,65 @@ def test_verify_artifact_rejects_symlink_escape(tmp_path):
 
 
 # ---------------------------------------------------------------------
+# OSError / TOCTOU handling: a permission error or a file that changes/
+# disappears mid-check must produce a failed result, never a raw
+# exception (UltraReview finding — src/core/artifact_verifier.py's
+# stat()/is_file()/hashing chain previously had no OSError handling).
+# ---------------------------------------------------------------------
+
+
+def test_verify_artifact_handles_permission_error_on_stat_or_exists(tmp_path, monkeypatch):
+    """Path.exists()/is_file() both call self.stat() internally and
+    re-raise a non-ignorable OSError (confirmed: errno=EACCES is not in
+    pathlib's _IGNORED_ERRNOS) rather than swallowing it — so patching
+    stat() alone is enough to exercise that path without needing to reach
+    all the way to the hashing step."""
+    manifest = _manifest()
+    size, checksum = _write_file(tmp_path / "audio" / "scene-01.wav", b"hello world")
+    artifact = _artifact(manifest.project_id, "audio/scene-01.wav", size, checksum)
+
+    original_stat = Path.stat
+
+    def raising_stat(self, *args, **kwargs):
+        if self.name == "scene-01.wav":
+            raise PermissionError(13, "Permission denied")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", raising_stat)
+
+    result = verify_artifact(tmp_path, artifact, manifest)
+
+    assert result.passed is False
+    assert any("could not inspect file" in reason for reason in result.reasons)
+    assert any("PermissionError" in reason for reason in result.reasons)
+    # Concise and non-sensitive: the raw OS error text is never included.
+    assert not any("Permission denied" in reason for reason in result.reasons)
+
+
+def test_verify_artifact_handles_oserror_during_hashing(tmp_path, monkeypatch):
+    """Isolates a failure specifically during the SHA-256 read step (file
+    exists, stat succeeds, only opening/reading for hashing fails) — e.g.
+    a TOCTOU race where the file is deleted or becomes unreadable between
+    the existence check and the hash read."""
+    import src.core.artifact_verifier as artifact_verifier_module
+
+    manifest = _manifest()
+    size, checksum = _write_file(tmp_path / "audio" / "scene-01.wav", b"hello world")
+    artifact = _artifact(manifest.project_id, "audio/scene-01.wav", size, checksum)
+
+    def raising_hash(_path):
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(artifact_verifier_module, "_sha256_of_file", raising_hash)
+
+    result = verify_artifact(tmp_path, artifact, manifest)
+
+    assert result.passed is False
+    assert any("could not inspect file" in reason for reason in result.reasons)
+    assert any("OSError" in reason for reason in result.reasons)
+
+
+# ---------------------------------------------------------------------
 # scene mismatch / manifest-project mismatch
 # ---------------------------------------------------------------------
 

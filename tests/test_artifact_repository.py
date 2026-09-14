@@ -11,6 +11,7 @@ import pytest
 
 from src.database.artifact_repository import (
     ArtifactAlreadyExistsError,
+    ArtifactProjectNotFoundError,
     DuplicateArtifactRegistrationError,
     get_artifact,
     list_artifacts_by_project,
@@ -121,6 +122,24 @@ def test_project_level_artifacts_scene_id_none_dedup_works(conn):
     )
     with pytest.raises(DuplicateArtifactRegistrationError):
         register_artifact(conn, render_b)
+
+
+# ---------------------------------------------------------------------
+# foreign-key violation is its own error, never mislabeled as a duplicate
+# (UltraReview finding — the FK case used to fall through to
+# DuplicateArtifactRegistrationError with a misleading message)
+# ---------------------------------------------------------------------
+
+
+def test_register_artifact_for_nonexistent_project_raises_project_not_found(conn):
+    record = _record(project_id="proj-does-not-exist")
+
+    with pytest.raises(ArtifactProjectNotFoundError) as excinfo:
+        register_artifact(conn, record)
+
+    assert "duplicate" not in str(excinfo.value).lower()
+    assert "proj-does-not-exist" in str(excinfo.value)
+    assert get_artifact(conn, record.artifact_id) is None  # nothing was written
 
 
 def test_different_scene_same_project_kind_path_does_not_conflict(conn):

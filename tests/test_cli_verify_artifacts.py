@@ -162,6 +162,23 @@ def test_verify_artifacts_parser_rejects_unknown_kind():
         parser.parse_args(["verify-artifacts", "proj-123", "--kind", "not-a-kind"])
 
 
+def test_cli_artifact_kinds_is_derived_from_the_canonical_enum_not_a_second_list():
+    """UltraReview finding: cli.py used to hardcode its own tuple of kind
+    strings, a second source of truth alongside src.models.enums.ArtifactKind.
+    This asserts the CLI's --kind choices are the SAME objects as the
+    canonical Literal's args, not merely equal-by-value to a
+    coincidentally-matching separate list."""
+    from typing import get_args
+
+    from src.models.enums import ArtifactKind
+
+    assert cli._ARTIFACT_KINDS == get_args(ArtifactKind)
+    for kind in cli._ARTIFACT_KINDS:
+        parser = cli.build_parser()
+        args = parser.parse_args(["verify-artifacts", "proj-123", "--kind", kind])
+        assert args.kind == kind
+
+
 # ---------------------------------------------------------------------
 # happy path: text + json, strictly read-only
 # ---------------------------------------------------------------------
@@ -359,3 +376,30 @@ def test_cmd_verify_artifacts_does_not_import_provider_or_render_modules(isolate
 
     rc = cli.cmd_verify_artifacts(argparse.Namespace(project_id=project_id, kind=None, format="text"))
     assert rc == 0
+
+
+# ---------------------------------------------------------------------
+# OSError during inspection: normal non-zero failure, never a raw
+# traceback (UltraReview finding)
+# ---------------------------------------------------------------------
+
+
+def test_cmd_verify_artifacts_reports_os_error_as_normal_failure_not_a_traceback(
+    isolated_db, capsys, monkeypatch
+):
+    project_id, project_dir = _create_registered_project(isolated_db / "projects")
+    _register_valid_audio_artifact(project_id, project_dir)
+
+    import src.core.artifact_verifier as artifact_verifier_module
+
+    def raising_hash(_path):
+        raise OSError("simulated disk error")
+
+    monkeypatch.setattr(artifact_verifier_module, "_sha256_of_file", raising_hash)
+
+    rc = cli.cmd_verify_artifacts(argparse.Namespace(project_id=project_id, kind=None, format="text"))
+    out = capsys.readouterr().out
+
+    assert rc == 1  # normal failure exit code, not an uncaught-exception crash
+    assert "[FAIL]" in out
+    assert "could not inspect file" in out
