@@ -5,9 +5,13 @@ import shutil
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 import os
+
+if TYPE_CHECKING:
+    from src.utils.channel_config import ChannelPolicy
 
 load_dotenv()
 
@@ -65,3 +69,16 @@ def get_settings() -> Settings:
         kokoro_model_path=models_dir / "kokoro-v1.0.onnx",
         kokoro_voices_path=models_dir / "voices-v1.0.bin",
     )
+
+
+def get_runtime_config() -> tuple[Settings, "ChannelPolicy"]:
+    """Phase 1B integration point only: returns the existing provider/path
+    Settings alongside the new channel-wide ChannelPolicy. Nothing yet
+    calls this from a provider, renderer, or CLI command — enforcing
+    ChannelPolicy across the pipeline is later-phase work. The import is
+    deferred so importing this module (done by nearly everything, e.g.
+    src/database/db.py) never requires pydantic to be installed; only
+    calling get_runtime_config() does."""
+    from src.utils.channel_config import get_channel_policy
+
+    return get_settings(), get_channel_policy()
