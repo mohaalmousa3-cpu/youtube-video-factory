@@ -2,7 +2,9 @@
 validation. No filesystem, no database, no network."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
@@ -206,6 +208,76 @@ def test_metadata_accepts_json_safe_scalars():
 def test_metadata_rejects_nested_containers():
     with pytest.raises(ValidationError):
         _record(metadata={"nested": {"not": "allowed"}})
+
+
+# ---------------------------------------------------------------------
+# metadata is deeply immutable (types.MappingProxyType), not just an
+# attribute frozen=True can't reassign
+# ---------------------------------------------------------------------
+
+
+def test_metadata_is_a_mapping_proxy():
+    record = _record(metadata={"voice": "kokoro-af"})
+    assert isinstance(record.metadata, MappingProxyType)
+
+
+def test_metadata_rejects_item_assignment():
+    record = _record(metadata={"voice": "kokoro-af"})
+    with pytest.raises((TypeError, AttributeError)):
+        record.metadata["voice"] = "different-voice"
+    assert record.metadata["voice"] == "kokoro-af"  # unchanged
+
+
+def test_metadata_rejects_item_deletion():
+    record = _record(metadata={"voice": "kokoro-af"})
+    with pytest.raises((TypeError, AttributeError)):
+        del record.metadata["voice"]
+    assert record.metadata["voice"] == "kokoro-af"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda m: m.update({"voice": "different-voice"}),
+        lambda m: m.clear(),
+        lambda m: m.pop("voice"),
+        lambda m: m.setdefault("voice", "different-voice"),
+    ],
+    ids=["update", "clear", "pop", "setdefault"],
+)
+def test_metadata_rejects_in_place_mutating_methods(mutate):
+    record = _record(metadata={"voice": "kokoro-af"})
+    with pytest.raises((TypeError, AttributeError)):
+        mutate(record.metadata)
+    assert record.metadata == {"voice": "kokoro-af"}  # unchanged
+
+
+def test_metadata_still_readable_via_normal_mapping_access():
+    record = _record(metadata={"voice": "kokoro-af", "duration": 4.2})
+    assert record.metadata["voice"] == "kokoro-af"
+    assert dict(record.metadata) == {"voice": "kokoro-af", "duration": 4.2}
+    assert set(record.metadata.keys()) == {"voice", "duration"}
+
+
+def test_metadata_json_dump_is_a_plain_json_compatible_object():
+    record = _record(metadata={"voice": "kokoro-af", "duration": 4.2, "retried": False, "note": None})
+    dumped = record.model_dump(mode="json")
+    assert type(dumped["metadata"]) is dict  # not a mappingproxy — plain dict, JSON round-trips
+    assert dumped["metadata"] == {
+        "voice": "kokoro-af",
+        "duration": 4.2,
+        "retried": False,
+        "note": None,
+    }
+    # round-trips through the stdlib json module unmodified.
+    assert json.loads(json.dumps(dumped)) == dumped
+
+
+def test_metadata_empty_dict_json_dump_is_plain_dict():
+    record = _record()
+    dumped = record.model_dump(mode="json")
+    assert dumped["metadata"] == {}
+    assert type(dumped["metadata"]) is dict
 
 
 # ---------------------------------------------------------------------

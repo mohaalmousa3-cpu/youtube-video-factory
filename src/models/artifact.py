@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from types import MappingProxyType
+from typing import Mapping
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_serializer, field_validator, model_validator
 
 from src.models.common import FrozenStrictModel
 from src.models.enums import ArtifactKind
@@ -83,12 +85,19 @@ class ArtifactRecord(FrozenStrictModel):
     # Minimal, JSON-safe only — no nested containers, no arbitrary
     # objects. A small bag of production notes (e.g. {"voice": "kokoro-af"}),
     # never a place to stash something structural that belongs in its own
-    # typed field. Note: unlike this model's scalar fields, `frozen=True`
-    # only blocks reassigning the `metadata` attribute itself, not
-    # in-place mutation of the dict it holds — acceptable for this small,
-    # single-owner notes bag (it is never shared/cached the way a
-    # VideoManifest is).
-    metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    # typed field. Deeply immutable, matching this model's frozen=True:
+    # pydantic validates the input as a normal mapping first (so the
+    # scalar-only / no-nested-container checks below still apply exactly
+    # as before), then _metadata_is_immutable freezes it into a
+    # types.MappingProxyType — item assignment, update(), pop(), clear(),
+    # and del all fail with AttributeError, not just attribute
+    # reassignment (which frozen=True already blocked on its own).
+    # _serialize_metadata converts it back to a plain dict on model_dump,
+    # since pydantic-core's serializer does not know how to encode a
+    # mappingproxy directly; artifact_repository.py's own
+    # json.dumps(dict(record.metadata), ...) does the same for the SQLite
+    # row.
+    metadata: Mapping[str, str | int | float | bool | None] = Field(default_factory=dict)
 
     @field_validator("relative_path")
     @classmethod
@@ -101,6 +110,19 @@ class ArtifactRecord(FrozenStrictModel):
         if value is not None and not _SCENE_ID_PATTERN.fullmatch(value):
             raise ValueError(f"scene_id {value!r} must match {_SCENE_ID_PATTERN.pattern!r}")
         return value
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_is_immutable(
+        cls, value: Mapping[str, str | int | float | bool | None]
+    ) -> MappingProxyType:
+        return MappingProxyType(dict(value))
+
+    @field_serializer("metadata")
+    def _serialize_metadata(
+        self, value: Mapping[str, str | int | float | bool | None]
+    ) -> dict[str, str | int | float | bool | None]:
+        return dict(value)
 
     @model_validator(mode="after")
     def _scene_association_matches_kind(self) -> "ArtifactRecord":

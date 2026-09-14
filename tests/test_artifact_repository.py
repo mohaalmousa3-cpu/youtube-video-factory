@@ -4,8 +4,10 @@ SQLite connection with src/database/db.py's SCHEMA applied directly — same
 fixture pattern as tests/test_project_repository.py."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
+from types import MappingProxyType
 
 import pytest
 
@@ -211,3 +213,26 @@ def test_metadata_round_trips_through_json_column(conn):
 
     loaded = get_artifact(conn, record.artifact_id)
     assert loaded.metadata == {"voice": "kokoro-af", "duration": 4.2, "retried": False, "note": None}
+    # The round-tripped record is just as immutable as the original — not
+    # merely equal-by-value while secretly holding a mutable plain dict.
+    assert isinstance(loaded.metadata, MappingProxyType)
+    with pytest.raises((TypeError, AttributeError)):
+        loaded.metadata["voice"] = "different-voice"
+
+
+def test_metadata_serialized_as_deterministic_sorted_json_in_the_column(conn):
+    """The immutable (MappingProxyType) metadata still reaches SQLite as
+    plain, deterministically key-sorted JSON text — not, say, Python repr
+    of a mappingproxy, and not insertion-order-dependent."""
+    record = _record(metadata={"voice": "kokoro-af", "duration": 4.2, "retried": False, "note": None})
+    register_artifact(conn, record)
+
+    row = conn.execute(
+        "SELECT metadata_json FROM artifacts WHERE artifact_id = ?", (record.artifact_id,)
+    ).fetchone()
+    assert row["metadata_json"] == (
+        '{"duration": 4.2, "note": null, "retried": false, "voice": "kokoro-af"}'
+    )
+    assert json.loads(row["metadata_json"]) == {
+        "voice": "kokoro-af", "duration": 4.2, "retried": False, "note": None,
+    }

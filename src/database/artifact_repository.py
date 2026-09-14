@@ -74,7 +74,10 @@ def _record_to_row_params(record: ArtifactRecord) -> tuple:
         record.byte_size,
         record.sha256_checksum,
         record.created_at.isoformat(),
-        json.dumps(record.metadata, sort_keys=True),
+        # record.metadata is a types.MappingProxyType (ArtifactRecord
+        # freezes it for immutability — see src/models/artifact.py) and
+        # json.dumps() only knows how to encode a plain dict, hence dict(...).
+        json.dumps(dict(record.metadata), sort_keys=True),
     )
 
 
