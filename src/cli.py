@@ -7,14 +7,27 @@ Phase 2A adds the read-only `dry-run` command. Phase 2B adds the read-only
 `verify-artifacts` command (src/core/artifact_verifier.py) — same
 strictly-read-only convention as `dry-run`: it uses
 src/database/db.py's get_readonly_connection(), never calls init_db(),
-and never transitions a project's stage. None of the new commands call a
-provider, an LLM, TTS, image generation, Flow, Veo, a renderer, FFmpeg, or
-any remote service — they only read local JSON files and read/write the
-local SQLite database. Error handling convention: every new command
-function catches its own domain errors and converts them to a short
-stderr message + non-zero exit code; none of them let a raw traceback
-reach the user, and none of them call sys.exit() themselves (only
-`main()`'s `raise SystemExit(main())` does that)."""
+and never transitions a project's stage. Phase 2C adds exactly one new
+write-capable command, `verify-and-advance`
+(src/core/verified_transition_service.py) — it verifies every required
+local artifact first and performs at most one guarded transition only if
+verification passes. Unlike `create-project`/`import-queue`, it never
+calls init_db(): it opens the existing database via
+src/database/db.py's get_existing_connection() (mode=rw, same
+never-create-anything contract as get_readonly_connection(), just
+writable), so a missing data directory or database file fails cleanly
+instead of being created. The only write it can ever perform is
+save_transition()'s single guarded UPDATE + INSERT, reached only after
+every precondition and artifact-verification check has already passed;
+it never creates a project or registers an artifact. None of the new
+commands call a provider, an LLM, TTS, image
+generation, Flow, Veo, a renderer, FFmpeg, or any remote service — they
+only read local JSON files and read/write the local SQLite database.
+Error handling convention: every new command function catches its own
+domain errors and converts them to a short stderr message + non-zero exit
+code; none of them let a raw traceback reach the user, and none of them
+call sys.exit() themselves (only `main()`'s `raise SystemExit(main())`
+does that)."""
 import argparse
 import json
 import sqlite3
@@ -22,6 +35,7 @@ import sys
 from pathlib import Path
 from typing import get_args
 
+from src.core.verified_transition_service import SUPPORTED_TARGET_STAGES
 from src.database.db import init_db
 from src.models.enums import ArtifactKind
 from src.utils.logging import setup_logging
@@ -493,6 +507,105 @@ def cmd_verify_artifacts(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _render_verify_and_advance_text(result) -> str:
+    lines = [
+        "verify-and-advance: "
+        + ("OK" if result.approved and result.db_committed else "FAILED")
+        + " (writes to SQLite only on success; no artifact file, manifest, or queue file is ever touched)",
+        f"project_id: {result.project_id}",
+        f"from_stage: {result.from_stage}",
+        f"to_stage: {result.to_stage}",
+        f"approved: {result.approved}",
+        f"db_committed: {result.db_committed}",
+        f"lifecycle_version_before: {result.lifecycle_version_before}",
+        f"lifecycle_version_after: {result.lifecycle_version_after}",
+    ]
+    lines.append("required_artifacts:")
+    for req in result.required_artifacts:
+        lines.append(f"  - kind={req.kind} scope={req.scope} scene_id={req.scene_id}")
+    lines.append("artifact_verification_results:")
+    for artifact_result in result.artifact_verification_results:
+        status = "PASS" if artifact_result.passed else "FAIL"
+        lines.append(
+            f"  [{status}] {artifact_result.artifact_id} kind={artifact_result.kind} "
+            f"scene_id={artifact_result.scene_id}"
+        )
+        for reason in artifact_result.reasons:
+            lines.append(f"      - {reason}")
+    lines.append("reasons:")
+    for reason in result.reasons:
+        lines.append(f"  - {reason}")
+    return "\n".join(lines)
+
+
+def cmd_verify_and_advance(args: argparse.Namespace) -> int:
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.verified_transition_service import VerifiedTransitionServiceError, verify_and_advance
+    from src.database.artifact_repository import list_artifacts_by_project
+    from src.database.db import get_existing_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"verify-and-advance: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not args.reason or not args.reason.strip():
+        print("verify-and-advance: FAILED — --reason is required and must not be empty", file=sys.stderr)
+        return 1
+
+    # Never calls init_db(): a missing data directory or database file
+    # must fail cleanly here, not be created — see get_existing_connection()'s
+    # docstring. Every precondition below (project exists, manifest loads,
+    # artifacts verify, transition is legal) is checked before this
+    # command can perform its one write.
+    try:
+        conn = get_existing_connection()
+    except sqlite3.Error as exc:
+        print(f"verify-and-advance: FAILED — no local project database found: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            print(
+                f"verify-and-advance: FAILED — no project found with project_id {args.project_id!r}",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            manifest = load_manifest(Path(project.manifest_path))
+        except ManifestStoreError as exc:
+            print(f"verify-and-advance: FAILED — {exc}", file=sys.stderr)
+            return 1
+
+        artifacts = list_artifacts_by_project(conn, args.project_id)
+
+        try:
+            result = verify_and_advance(conn, project, manifest, artifacts, args.to, args.reason)
+        except VerifiedTransitionServiceError as exc:
+            print(f"verify-and-advance: FAILED — {exc}", file=sys.stderr)
+            return 1
+    except sqlite3.Error as exc:
+        print(f"verify-and-advance: FAILED — {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    ok = result.approved and result.db_committed
+
+    if out_format == "json":
+        print(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_verify_and_advance_text(result))
+
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -573,6 +686,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_artifacts.add_argument("--format", default="text", help="Output format: text (default) or json")
     verify_artifacts.set_defaults(func=cmd_verify_artifacts)
+
+    verify_and_advance = sub.add_parser(
+        "verify-and-advance",
+        help="Verify required local artifacts, then perform exactly one guarded transition into a "
+        "verification-required stage; writes to SQLite only on success",
+    )
+    verify_and_advance.add_argument("project_id")
+    verify_and_advance.add_argument(
+        "--to",
+        required=True,
+        choices=sorted(SUPPORTED_TARGET_STAGES),
+        help="Target lifecycle stage to verify and advance into",
+    )
+    verify_and_advance.add_argument("--reason", required=True, help="Explicit reason for this transition")
+    verify_and_advance.add_argument("--format", default="text", help="Output format: text (default) or json")
+    verify_and_advance.set_defaults(func=cmd_verify_and_advance)
 
     return parser
 

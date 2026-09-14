@@ -111,6 +111,32 @@ def get_readonly_connection() -> sqlite3.Connection:
     return conn
 
 
+def get_existing_connection() -> sqlite3.Connection:
+    """Open the existing jobs.db for read-write access, via a SQLite URI
+    connection (mode=rw) — for a command (verify-and-advance) that must be
+    able to write on success but must never create the data directory,
+    the database file, or its journal/WAL/SHM files as a side effect of
+    merely checking whether a project/artifact exists. Same
+    never-create-anything contract as get_readonly_connection() above,
+    just not read-only: mode=rw (unlike sqlite3.connect()'s default
+    mode=rwc) still refuses to create a missing database file. Never
+    calls data_dir.mkdir() and never lets SQLite create a missing
+    database file: if the data directory or jobs.db does not exist (or
+    exists but can't be opened), this raises sqlite3.OperationalError,
+    same as get_readonly_connection() — callers already handle that as a
+    clean, no-side-effect error. A sidecar journal/WAL/SHM file may still
+    appear once the caller actually starts a write transaction (e.g. via
+    save_transition()) — that is a normal, expected part of that write,
+    not something this function itself creates."""
+    settings = get_settings()
+    db_path = settings.data_dir / "jobs.db"
+    uri = f"{db_path.resolve().as_uri()}?mode=rw"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
 def init_db() -> None:
     conn = get_connection()
     try:
