@@ -1,37 +1,21 @@
 {
   "queue_version": "1.0",
-  "stories": [
+  "items": [
     {
-      "story_id": "why-we-care-what-people-think",
-      "title": "Why We Care So Much What People Think",
-      "language": "en",
-      "hook": "Your brain treats being ignored like physical pain. Here's the research that proves it.",
-      "key_facts": [
-        {
-          "claim": "Social exclusion activates the same brain regions as physical pain.",
-          "source": "Kipling Williams' Cyberball ostracism studies"
-        }
-      ],
-      "target_length_seconds": 480,
-      "tone": "calm",
-      "creative_prompt_ref": "core-creative-v1",
-      "role_outfit_ref": "narrator-default"
+      "queue_item_id": "item-001",
+      "story_input_path": "stories/why-we-care-what-people-think.json",
+      "scene_plan_path": "scenes/why-we-care-what-people-think.json",
+      "owner_notes": "First candidate for the next batch — reviewed and approved 2026-09-13.",
+      "output_subdirectory": null,
+      "enabled": true
     },
     {
-      "story_id": "the-spotlight-effect",
-      "title": "Nobody Is Looking At You As Much As You Think",
-      "language": "en",
-      "hook": "You remember that awkward moment forever. Everyone else forgot it in ten seconds.",
-      "key_facts": [
-        {
-          "claim": "People overestimate how much others notice their appearance or mistakes.",
-          "source": "Gilovich, Medvec & Savitsky, the spotlight effect"
-        }
-      ],
-      "target_length_seconds": 360,
-      "tone": "warm",
-      "creative_prompt_ref": "core-creative-v1",
-      "role_outfit_ref": "narrator-default"
+      "queue_item_id": "item-002",
+      "story_input_path": "stories/the-spotlight-effect.json",
+      "scene_plan_path": "scenes/the-spotlight-effect.json",
+      "owner_notes": "Still waiting on scene review — leave disabled until approved.",
+      "output_subdirectory": null,
+      "enabled": false
     }
   ]
 }

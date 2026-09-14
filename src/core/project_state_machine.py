@@ -309,7 +309,14 @@ def transition_project(
     updated = _replace(
         project,
         current_stage=to_stage,
-        last_successful_stage=to_stage,
+        # last_successful_stage means the most recently COMPLETED and
+        # verified checkpoint — only a _VERIFICATION_REQUIRED_STAGES entry
+        # (a "_ready"/"rendered"/"qc_passed"/"completed" stage) advances it;
+        # entering an in-progress "_pending" stage (or ready_for_manual_publish,
+        # a bookkeeping consequence of qc_passed) must leave it unchanged.
+        last_successful_stage=(
+            to_stage if to_stage in _VERIFICATION_REQUIRED_STAGES else project.last_successful_stage
+        ),
         failed_stage=None,
         failure_message=None,
         lifecycle_version=project.lifecycle_version + 1,

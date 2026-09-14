@@ -131,8 +131,15 @@ class ProjectRecord(FrozenStrictModel):
         if self.current_stage == "completed":
             if self.completed_at is None:
                 raise ValueError("completed_at must be set when current_stage is 'completed'")
+        elif self.current_stage == "archived":
+            # completed_at is a historical timestamp here: None if archived
+            # before ever completing, or the original completion time if
+            # archived afterward — either is valid, it is never cleared.
+            pass
         elif self.completed_at is not None:
-            raise ValueError("completed_at must be None unless current_stage is 'completed'")
+            raise ValueError(
+                "completed_at must be None unless current_stage is 'completed' or 'archived'"
+            )
 
         return self
 
