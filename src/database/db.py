@@ -60,10 +60,28 @@ CREATE TABLE IF NOT EXISTS project_transitions (
 
 def get_connection() -> sqlite3.Connection:
     settings = get_settings()
+    settings.data_dir.mkdir(exist_ok=True)
     db_path = settings.data_dir / "jobs.db"
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def get_readonly_connection() -> sqlite3.Connection:
+    """Open the existing jobs.db strictly read-only, via a SQLite URI
+    connection (mode=ro) — for callers (the dry-run CLI command) that must
+    never create the data directory, the database file, or its journal/
+    WAL/SHM files. Never calls data_dir.mkdir() and never lets SQLite
+    create a missing database file: if the data directory or jobs.db does
+    not exist (or exists but can't be read), this raises
+    sqlite3.OperationalError, same as any other read failure — callers
+    already handle that as a clean, no-side-effect error."""
+    settings = get_settings()
+    db_path = settings.data_dir / "jobs.db"
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
     return conn
 
 

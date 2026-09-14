@@ -337,7 +337,7 @@ def _render_dry_run_text(report) -> str:
 def cmd_dry_run(args: argparse.Namespace) -> int:
     from src.core.dry_run_orchestrator import DryRunOrchestratorError, build_dry_run_report
     from src.core.manifest_store import ManifestStoreError, load_manifest
-    from src.database.db import get_connection
+    from src.database.db import get_readonly_connection
     from src.database.project_repository import get_project, list_project_transitions
     from src.utils.channel_config import ChannelConfigError, get_channel_policy
 
@@ -346,9 +346,11 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
         print(f"dry-run: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')", file=sys.stderr)
         return 1
 
+    # Strictly read-only: never init_db()/create the data directory, the
+    # database file, or its journal/WAL/SHM files — a missing or unreadable
+    # database is reported as a clean dry-run error below, not created.
     try:
-        init_db()
-        conn = get_connection()
+        conn = get_readonly_connection()
         try:
             project = get_project(conn, args.project_id)
             if project is None:

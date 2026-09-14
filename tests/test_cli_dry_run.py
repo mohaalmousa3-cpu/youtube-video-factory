@@ -139,6 +139,16 @@ def test_cmd_dry_run_text_and_json_output_are_read_only(isolated_db, tmp_path, c
 
 
 def test_cmd_dry_run_unknown_project_returns_error(isolated_db, capsys):
+    """Distinct from a missing database (see
+    test_cmd_dry_run_missing_database_fails_safely_and_creates_nothing):
+    the registry exists and is readable, this project_id just isn't in it.
+    Dry-run is read-only and must never call init_db() itself, so the test
+    creates the (otherwise empty) database directly, the same way any
+    other already-onboarded project would have caused it to exist."""
+    from src.database.db import init_db
+
+    init_db()
+
     rc = cli.cmd_dry_run(argparse.Namespace(project_id="does-not-exist", format="text"))
     assert rc == 1
     assert "no project found" in capsys.readouterr().err
@@ -192,11 +202,28 @@ def test_cmd_dry_run_unreadable_db_returns_error(isolated_db, monkeypatch, capsy
     def _boom():
         raise sqlite3.OperationalError("db not readable")
 
-    monkeypatch.setattr(db, "get_connection", _boom)
+    monkeypatch.setattr(db, "get_readonly_connection", _boom)
 
     rc = cli.cmd_dry_run(argparse.Namespace(project_id="any", format="text"))
     assert rc == 1
     assert "could not read project registry" in capsys.readouterr().err
+
+
+def test_cmd_dry_run_missing_database_fails_safely_and_creates_nothing(isolated_db, capsys):
+    """isolated_db only points PROJECT_ROOT at a fresh tmp_path — no data/
+    directory, no jobs.db, nothing has been created yet. Dry-run must never
+    call init_db()/create the database as a side effect of merely looking
+    up a project: it must fail cleanly and leave the directory exactly as
+    empty as it found it."""
+    data_dir = isolated_db / "data"
+    assert not data_dir.exists()
+
+    rc = cli.cmd_dry_run(argparse.Namespace(project_id="proj-does-not-exist", format="text"))
+
+    assert rc == 1
+    assert "could not read project registry" in capsys.readouterr().err
+    assert not data_dir.exists()
+    assert list(isolated_db.iterdir()) == []  # nothing at all was created
 
 
 def test_cmd_dry_run_does_not_import_provider_or_render_modules(isolated_db, tmp_path, monkeypatch):
