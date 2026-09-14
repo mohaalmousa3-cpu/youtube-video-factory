@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from src.core.path_safety import resolve_under_project_dir as _resolve_under_project_dir
 from src.models.artifact import ArtifactRecord, ArtifactVerificationResult
 from src.models.manifest import VideoManifest
 
@@ -29,28 +30,6 @@ def _sha256_of_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _resolve_under_project_dir(project_dir_resolved: Path, relative_path: str) -> Path | None:
-    """Resolve `relative_path` under `project_dir_resolved` (which the
-    caller must already have `.resolve()`d — once per batch, not once per
-    artifact, is the whole point of the amortization in verify_artifacts()
-    below), following symlinks, and return None if the resolved path
-    escapes it. ArtifactRecord's own validator already rejects an absolute
-    path or '..' segment at construction time (a string-only check); this
-    is the runtime, filesystem-aware check that additionally catches what
-    that cannot: a symlink inside the project directory whose target lies
-    outside it."""
-    candidate = project_dir_resolved / relative_path
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        return None
-    try:
-        resolved.relative_to(project_dir_resolved)
-    except ValueError:
-        return None
-    return resolved
 
 
 def _verify_one(

@@ -19,10 +19,21 @@ writable), so a missing data directory or database file fails cleanly
 instead of being created. The only write it can ever perform is
 save_transition()'s single guarded UPDATE + INSERT, reached only after
 every precondition and artifact-verification check has already passed;
-it never creates a project or registers an artifact. None of the new
+it never creates a project or registers an artifact. Phase 2D adds exactly
+one new write-capable command, `register-audio-artifact`
+(src/core/audio_artifact_registrar.py) — registration-first: it registers
+an already-produced local audio file as one scene's canonical "audio"
+artifact (fixed identity, no alternate takes), the one remaining local
+step verify-and-advance needs to advance a project into "audio_ready". It
+also never calls init_db() (same get_existing_connection() contract as
+verify-and-advance), never mutates the manifest, and never transitions a
+project's lifecycle stage itself. None of the new
 commands call a provider, an LLM, TTS, image
-generation, Flow, Veo, a renderer, FFmpeg, or any remote service — they
-only read local JSON files and read/write the local SQLite database.
+generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`
+is the only command that uses a renderer module (src/render/ffmpeg_render's
+local ffprobe wrapper, to measure a source file's real duration); every
+other command only reads local JSON files and reads/writes the local
+SQLite database.
 Error handling convention: every new command function catches its own
 domain errors and converts them to a short stderr message + non-zero exit
 code; none of them let a raw traceback reach the user, and none of them
@@ -606,6 +617,94 @@ def cmd_verify_and_advance(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _render_register_audio_artifact_text(result) -> str:
+    status = "OK" if result.ok else "FAILED"
+    idempotent_note = " (idempotent no-op — nothing was written)" if result.idempotent else ""
+    lines = [
+        f"register-audio-artifact: {status}{idempotent_note} "
+        "(writes exactly one artifact row on a fresh registration; the manifest and "
+        "project lifecycle stage are never touched)",
+        f"project_id: {result.project_id}",
+        f"scene_id: {result.scene_id}",
+        f"artifact_id: {result.artifact_id}",
+        f"relative_path: {result.relative_path}",
+        f"copied: {result.copied}",
+        f"duration_seconds: {result.duration_seconds}",
+    ]
+    for reason in result.reasons:
+        lines.append(f"  - {reason}")
+    return "\n".join(lines)
+
+
+def cmd_register_audio_artifact(args: argparse.Namespace) -> int:
+    from src.core.audio_artifact_registrar import AudioArtifactRegistrationError, register_audio_artifact
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.database.db import get_existing_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"register-audio-artifact: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Never calls init_db(): a missing data directory or database file
+    # must fail cleanly here, not be created — same contract as
+    # verify-and-advance's get_existing_connection().
+    try:
+        conn = get_existing_connection()
+    except sqlite3.Error as exc:
+        print(f"register-audio-artifact: FAILED — no local project database found: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            print(
+                f"register-audio-artifact: FAILED — no project found with project_id {args.project_id!r}",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            manifest = load_manifest(Path(project.manifest_path))
+        except ManifestStoreError as exc:
+            print(f"register-audio-artifact: FAILED — {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            result = register_audio_artifact(conn, project, manifest, args.scene_id, Path(args.file))
+        except AudioArtifactRegistrationError as exc:
+            print(f"register-audio-artifact: FAILED — {exc}", file=sys.stderr)
+            return 1
+    except sqlite3.Error as exc:
+        print(f"register-audio-artifact: FAILED — {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    if out_format == "json":
+        payload = {
+            "project_id": result.project_id,
+            "scene_id": result.scene_id,
+            "artifact_id": result.artifact_id,
+            "relative_path": result.relative_path,
+            "ok": result.ok,
+            "idempotent": result.idempotent,
+            "copied": result.copied,
+            "duration_seconds": result.duration_seconds,
+            "reasons": list(result.reasons),
+            "artifact": result.artifact.model_dump(mode="json") if result.artifact is not None else None,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_register_audio_artifact_text(result))
+
+    return 0 if result.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -702,6 +801,17 @@ def build_parser() -> argparse.ArgumentParser:
     verify_and_advance.add_argument("--reason", required=True, help="Explicit reason for this transition")
     verify_and_advance.add_argument("--format", default="text", help="Output format: text (default) or json")
     verify_and_advance.set_defaults(func=cmd_verify_and_advance)
+
+    register_audio_artifact = sub.add_parser(
+        "register-audio-artifact",
+        help="Register a locally produced audio file as one scene's canonical audio artifact; "
+        "writes to SQLite (and copies the file) only on a fresh registration",
+    )
+    register_audio_artifact.add_argument("project_id")
+    register_audio_artifact.add_argument("--scene-id", required=True, help="Scene this audio artifact belongs to")
+    register_audio_artifact.add_argument("--file", required=True, help="Path to the local audio file to register")
+    register_audio_artifact.add_argument("--format", default="text", help="Output format: text (default) or json")
+    register_audio_artifact.set_defaults(func=cmd_register_audio_artifact)
 
     return parser
 
