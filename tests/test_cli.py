@@ -74,6 +74,15 @@ def _write_story_and_scenes(tmp_path, **overrides) -> tuple:
     return story_path, scenes_path
 
 
+def _write_scenes_only(tmp_path, **overrides):
+    """Writes only scenes.json — for tests that deliberately put invalid
+    content in story.json first and must not have it clobbered by a
+    subsequent call to _write_story_and_scenes()."""
+    scenes_path = tmp_path / "scenes.json"
+    _write_json(scenes_path, _scene_plan_dict(**overrides))
+    return scenes_path
+
+
 # ---------------------------------------------------------------------
 # health / init-db unchanged
 # ---------------------------------------------------------------------
@@ -125,7 +134,7 @@ def test_cmd_validate_input_succeeds_and_writes_nothing(tmp_path, capsys):
 def test_cmd_validate_input_rejects_malformed_json(tmp_path, capsys):
     story_path = tmp_path / "story.json"
     story_path.write_text("{not valid json")
-    _, scenes_path = _write_story_and_scenes(tmp_path)
+    scenes_path = _write_scenes_only(tmp_path)
 
     rc = cli.cmd_validate_input(argparse.Namespace(story=str(story_path), scenes=str(scenes_path)))
 
@@ -136,7 +145,7 @@ def test_cmd_validate_input_rejects_malformed_json(tmp_path, capsys):
 def test_cmd_validate_input_rejects_non_object_json(tmp_path, capsys):
     story_path = tmp_path / "story.json"
     story_path.write_text("[1, 2, 3]")
-    _, scenes_path = _write_story_and_scenes(tmp_path)
+    scenes_path = _write_scenes_only(tmp_path)
 
     rc = cli.cmd_validate_input(argparse.Namespace(story=str(story_path), scenes=str(scenes_path)))
 

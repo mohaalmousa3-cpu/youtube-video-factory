@@ -134,7 +134,10 @@ def load_scene_plan_file(path: Path) -> ScenePlan:
 
 
 def load_queue_import(path: Path) -> QueueImport:
-    raw = _load_json_object(path, what="queue import file")
+    try:
+        raw = _load_json_object(path, what="queue import file")
+    except InputFileError as exc:
+        raise QueueImportError(str(exc)) from exc
     try:
         return QueueImport.model_validate(raw)
     except ValidationError as exc:

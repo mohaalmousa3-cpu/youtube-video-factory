@@ -139,6 +139,35 @@ def test_canonical_route_reaches_completed():
     assert project.lifecycle_version == 13  # 1 initial + 12 transitions
 
 
+def test_last_successful_stage_only_advances_on_verified_checkpoints():
+    """last_successful_stage means the most recently COMPLETED and verified
+    checkpoint — entering an in-progress "_pending" stage (or
+    ready_for_manual_publish) must leave it at the prior checkpoint, only a
+    "_ready"/"rendered"/"qc_passed"/"completed" stage advances it."""
+    project = _initial_project()
+    assert project.last_successful_stage == "planned"
+
+    steps = [
+        ("audio_pending", False, "planned"),
+        ("audio_ready", True, "audio_ready"),
+        ("visuals_pending", False, "audio_ready"),
+        ("visuals_ready", True, "visuals_ready"),
+        ("animation_pending", False, "visuals_ready"),
+        ("animation_ready", True, "animation_ready"),
+        ("render_pending", False, "animation_ready"),
+        ("rendered", True, "rendered"),
+        ("qc_pending", False, "rendered"),
+        ("qc_passed", True, "qc_passed"),
+        ("ready_for_manual_publish", False, "qc_passed"),
+    ]
+    for stage, verified, expected_checkpoint in steps:
+        project = _advance(project, stage, verified=verified)
+        assert project.last_successful_stage == expected_checkpoint
+
+    project = _advance(project, "completed", verified=True, reason="manual completion recorded")
+    assert project.last_successful_stage == "completed"
+
+
 def test_planned_skips_script_approved_directly_to_audio_pending():
     project = _initial_project()
     updated, transition = transition_project(project, "audio_pending", now=FIXED_NOW)
@@ -313,6 +342,7 @@ def test_retry_clears_failure_fields_without_marking_success():
     assert retried.current_stage == "audio_pending"  # not audio_ready — no false success
     assert retried.failed_stage is None
     assert retried.failure_message is None
+    assert retried.last_successful_stage == "planned"  # retry preserves the prior checkpoint
     assert retried.retry_count == 1
     assert transition.is_retry is True
     assert transition.from_stage == "failed"
@@ -366,6 +396,7 @@ def test_archiving_is_allowed_from_an_active_in_progress_stage():
     project = _advance(project, "audio_pending")
     archived, transition = transition_project(project, "archived", now=FIXED_NOW, reason="priorities changed")
     assert archived.current_stage == "archived"
+    assert archived.last_successful_stage == "planned"  # archiving preserves it as-is
     assert transition.from_stage == "audio_pending"
 
 
@@ -376,6 +407,16 @@ def test_archiving_is_allowed_from_failed():
     archived, _ = transition_project(failed, "archived", now=LATER_NOW, reason="giving up")
     assert archived.current_stage == "archived"
     assert archived.failed_stage is None  # cleared — failed_stage only makes sense while failed
+    assert archived.last_successful_stage == "planned"  # archiving preserves it as-is
+
+
+def test_archived_before_completion_has_no_completed_at():
+    project = _initial_project()
+    project = _advance(project, "audio_pending")
+    archived, _ = transition_project(project, "archived", now=LATER_NOW, reason="abandoned early")
+    assert archived.current_stage == "archived"
+    assert archived.completed_at is None
+    assert archived.archived_at == LATER_NOW
 
 
 def test_completed_only_allows_archiving_afterward():
@@ -394,8 +435,19 @@ def test_completed_only_allows_archiving_afterward():
     with pytest.raises(ProjectStateTransitionError):
         transition_project(project, "audio_pending", now=LATER_NOW)
 
-    archived, _ = transition_project(project, "archived", now=LATER_NOW, reason="cleanup")
+    assert project.completed_at == FIXED_NOW
+
+    archived, transition = transition_project(project, "archived", now=LATER_NOW, reason="cleanup")
     assert archived.current_stage == "archived"
+    assert archived.completed_at == FIXED_NOW  # historical completion time, preserved exactly
+    assert archived.archived_at == LATER_NOW
+    assert archived.last_successful_stage == "completed"
+    assert transition.from_stage == "completed"
+    assert transition.reason == "cleanup"
+
+    # Archived remains terminal even when reached from "completed".
+    with pytest.raises(ProjectStateTransitionError):
+        transition_project(archived, "audio_pending", now=LATER_NOW)
 
 
 # ---------------------------------------------------------------------
@@ -527,3 +579,25 @@ def test_project_record_rejects_incoherent_field_combinations(overrides):
     base.update(overrides)
     with pytest.raises(ValidationError):
         ProjectRecord(**base)
+
+
+def test_project_record_allows_historical_completed_at_when_archived():
+    """archived is the one exception to "completed_at only while
+    current_stage == completed": a project completed before being archived
+    keeps its original completed_at as history."""
+    ProjectRecord(
+        project_id="proj-x",
+        manifest_path="data/projects/x/manifest.json",
+        manifest_fingerprint="f" * 64,
+        current_stage="archived",
+        last_successful_stage="completed",
+        failed_stage=None,
+        failure_message=None,
+        lifecycle_version=2,
+        created_at=FIXED_NOW,
+        updated_at=LATER_NOW,
+        completed_at=FIXED_NOW,
+        archived_at=LATER_NOW,
+        retry_count=0,
+        execution_status="not_executed",
+    )

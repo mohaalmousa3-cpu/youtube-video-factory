@@ -221,6 +221,24 @@ def test_load_queue_import_non_object_json_raises(tmp_path):
         load_queue_import(path)
 
 
+def test_load_queue_import_missing_file_raises(tmp_path):
+    """Every queue-file failure — including one that _load_json_object
+    itself reports as InputFileError (missing, bad JSON, non-object) — must
+    surface as QueueImportError, so a caller only ever needs to catch one
+    exception type for the whole "import-queue" command. This is unlike
+    load_story_input_file/load_scene_plan_file, which deliberately keep
+    raising InputFileError for a single story/scene file."""
+    with pytest.raises(QueueImportError):
+        load_queue_import(tmp_path / "does-not-exist.json")
+
+
+def test_load_queue_import_invalid_json_raises(tmp_path):
+    path = tmp_path / "queue.json"
+    path.write_text("{not valid json")
+    with pytest.raises(QueueImportError):
+        load_queue_import(path)
+
+
 # ---------------------------------------------------------------------
 # create_project_from_inputs (single project)
 # ---------------------------------------------------------------------
