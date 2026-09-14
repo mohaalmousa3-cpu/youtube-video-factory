@@ -33,13 +33,19 @@ for one PNG "visual" artifact per scene — same fixed-identity,
 registration-first, never-init_db(), never-mutates-the-manifest,
 stage-agnostic design as `register-audio-artifact`, validated with Pillow
 (already a pinned dependency) instead of ffprobe; PNG only, no Qwen-size
-restrictions. None of the new
+restrictions. Phase 2F adds `register-animation-artifact`
+(src/core/animation_artifact_registrar.py) for one MP4 "animation"
+artifact per scene — same fixed-identity/registration-first/stage-agnostic
+design again, validated with ffprobe like `register-audio-artifact` (real
+duration AND at least one actual video stream — an audio-only file is
+rejected even though it has a valid duration). None of the new
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`
-uses a renderer module (src/render/ffmpeg_render's local ffprobe wrapper,
-to measure a source file's real duration) and `register-visual-artifact`
-uses Pillow (to decode-validate a source image); every other command only
-reads local JSON files and reads/writes the local SQLite database.
+and `register-animation-artifact` use a renderer module
+(src/render/ffmpeg_render's local ffprobe wrapper, to measure a source
+file's real duration) and `register-visual-artifact` uses Pillow (to
+decode-validate a source image); every other command only reads local
+JSON files and reads/writes the local SQLite database.
 Error handling convention: every new command function catches its own
 domain errors and converts them to a short stderr message + non-zero exit
 code; none of them let a raw traceback reach the user, and none of them
@@ -803,6 +809,98 @@ def cmd_register_visual_artifact(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _render_register_animation_artifact_text(result) -> str:
+    status = "OK" if result.ok else "FAILED"
+    idempotent_note = " (idempotent no-op — nothing was written)" if result.idempotent else ""
+    lines = [
+        f"register-animation-artifact: {status}{idempotent_note} "
+        "(writes exactly one artifact row on a fresh registration; the manifest and "
+        "project lifecycle stage are never touched)",
+        f"project_id: {result.project_id}",
+        f"scene_id: {result.scene_id}",
+        f"artifact_id: {result.artifact_id}",
+        f"relative_path: {result.relative_path}",
+        f"copied: {result.copied}",
+        f"duration_seconds: {result.duration_seconds}",
+    ]
+    for reason in result.reasons:
+        lines.append(f"  - {reason}")
+    return "\n".join(lines)
+
+
+def cmd_register_animation_artifact(args: argparse.Namespace) -> int:
+    from src.core.animation_artifact_registrar import (
+        AnimationArtifactRegistrationError,
+        register_animation_artifact,
+    )
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.database.db import get_existing_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"register-animation-artifact: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Never calls init_db(): a missing data directory or database file
+    # must fail cleanly here, not be created — same contract as
+    # verify-and-advance's/register-audio-artifact's/register-visual-artifact's
+    # get_existing_connection().
+    try:
+        conn = get_existing_connection()
+    except sqlite3.Error as exc:
+        print(f"register-animation-artifact: FAILED — no local project database found: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            print(
+                f"register-animation-artifact: FAILED — no project found with project_id {args.project_id!r}",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            manifest = load_manifest(Path(project.manifest_path))
+        except ManifestStoreError as exc:
+            print(f"register-animation-artifact: FAILED — {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            result = register_animation_artifact(conn, project, manifest, args.scene_id, Path(args.file))
+        except AnimationArtifactRegistrationError as exc:
+            print(f"register-animation-artifact: FAILED — {exc}", file=sys.stderr)
+            return 1
+    except sqlite3.Error as exc:
+        print(f"register-animation-artifact: FAILED — {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    if out_format == "json":
+        payload = {
+            "project_id": result.project_id,
+            "scene_id": result.scene_id,
+            "artifact_id": result.artifact_id,
+            "relative_path": result.relative_path,
+            "ok": result.ok,
+            "idempotent": result.idempotent,
+            "copied": result.copied,
+            "duration_seconds": result.duration_seconds,
+            "reasons": list(result.reasons),
+            "artifact": result.artifact.model_dump(mode="json") if result.artifact is not None else None,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_register_animation_artifact_text(result))
+
+    return 0 if result.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -921,6 +1019,19 @@ def build_parser() -> argparse.ArgumentParser:
     register_visual_artifact.add_argument("--file", required=True, help="Path to the local PNG image to register")
     register_visual_artifact.add_argument("--format", default="text", help="Output format: text (default) or json")
     register_visual_artifact.set_defaults(func=cmd_register_visual_artifact)
+
+    register_animation_artifact = sub.add_parser(
+        "register-animation-artifact",
+        help="Register a locally produced MP4 video as one scene's canonical animation artifact; "
+        "writes to SQLite (and copies the file) only on a fresh registration",
+    )
+    register_animation_artifact.add_argument("project_id")
+    register_animation_artifact.add_argument(
+        "--scene-id", required=True, help="Scene this animation artifact belongs to"
+    )
+    register_animation_artifact.add_argument("--file", required=True, help="Path to the local MP4 video to register")
+    register_animation_artifact.add_argument("--format", default="text", help="Output format: text (default) or json")
+    register_animation_artifact.set_defaults(func=cmd_register_animation_artifact)
 
     return parser
 
