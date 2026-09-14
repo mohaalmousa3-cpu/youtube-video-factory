@@ -55,6 +55,32 @@ CREATE TABLE IF NOT EXISTS project_transitions (
     is_retry           INTEGER NOT NULL,
     lifecycle_version  INTEGER NOT NULL
 );
+
+-- Phase 2B: local artifact registry — one row per produced (or
+-- to-be-produced) file a project's pipeline stages claim exist. Additive
+-- only: no existing table above is modified. See src/models/artifact.py
+-- (ArtifactRecord), src/database/artifact_repository.py (this table's
+-- read/write API), and src/core/artifact_verifier.py (the read-only
+-- checker that verifies a registered row against the real file).
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id     TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects (project_id),
+    kind            TEXT NOT NULL CHECK (kind IN ('audio','visual','animation','render','qc_report')),
+    scene_id        TEXT,
+    relative_path   TEXT NOT NULL,
+    byte_size       INTEGER NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    metadata_json   TEXT NOT NULL DEFAULT '{}'
+);
+
+-- One registration per (project, kind, scene, path). SQLite treats NULL
+-- as distinct from NULL in a plain UNIQUE constraint, so scene_id is
+-- coalesced to '' here — otherwise two project-level rows (scene_id IS
+-- NULL, e.g. two "render" artifacts for the same project/path) would
+-- never conflict.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_identity
+ON artifacts (project_id, kind, COALESCE(scene_id, ''), relative_path);
 """
 
 

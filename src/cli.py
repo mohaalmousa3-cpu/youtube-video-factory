@@ -3,20 +3,27 @@
 Phase 1E adds local-only commands (validate-input, create-project,
 import-queue, list-projects, status, resume-plan, validate-manifest) on
 top of the pre-existing `health`/`init-db` commands, which are unchanged.
-None of the new commands call a provider, an LLM, TTS, image generation,
-Flow, Veo, a renderer, FFmpeg, or any remote service — they only read
-local JSON files and read/write the local SQLite database. Error handling
-convention: every new command function catches its own domain errors and
-converts them to a short stderr message + non-zero exit code; none of them
-let a raw traceback reach the user, and none of them call sys.exit()
-themselves (only `main()`'s `raise SystemExit(main())` does that)."""
+Phase 2A adds the read-only `dry-run` command. Phase 2B adds the read-only
+`verify-artifacts` command (src/core/artifact_verifier.py) — same
+strictly-read-only convention as `dry-run`: it uses
+src/database/db.py's get_readonly_connection(), never calls init_db(),
+and never transitions a project's stage. None of the new commands call a
+provider, an LLM, TTS, image generation, Flow, Veo, a renderer, FFmpeg, or
+any remote service — they only read local JSON files and read/write the
+local SQLite database. Error handling convention: every new command
+function catches its own domain errors and converts them to a short
+stderr message + non-zero exit code; none of them let a raw traceback
+reach the user, and none of them call sys.exit() themselves (only
+`main()`'s `raise SystemExit(main())` does that)."""
 import argparse
 import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import get_args
 
 from src.database.db import init_db
+from src.models.enums import ArtifactKind
 from src.utils.logging import setup_logging
 
 
@@ -383,6 +390,109 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
+# Derived from the canonical src.models.enums.ArtifactKind Literal — not a
+# second, independently-maintained list of kinds. A new kind added there
+# is automatically a valid --kind choice here, with no second edit needed.
+_ARTIFACT_KINDS = get_args(ArtifactKind)
+
+
+def _render_verify_artifacts_text(project_id: str, kind: str | None, results) -> str:
+    lines = [
+        "verify-artifacts: read-only verification only "
+        "(no files, database rows, or project state were changed)",
+        f"project_id: {project_id}",
+        f"kind_filter: {kind}",
+        f"artifact_count: {len(results)}",
+    ]
+    for result in results:
+        status = "PASS" if result.passed else "FAIL"
+        lines.append(
+            f"  [{status}] {result.artifact_id} kind={result.kind} "
+            f"scene_id={result.scene_id} path={result.relative_path}"
+        )
+        for reason in result.reasons:
+            lines.append(f"      - {reason}")
+    passed_count = sum(1 for r in results if r.passed)
+    lines.append(f"passed: {passed_count}/{len(results)}")
+    return "\n".join(lines)
+
+
+def cmd_verify_artifacts(args: argparse.Namespace) -> int:
+    from src.core.artifact_verifier import verify_artifacts
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.database.artifact_repository import list_artifacts_by_project
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"verify-artifacts: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Strictly read-only, same convention as cmd_dry_run: never
+    # init_db()/create the data directory, the database file, or its
+    # journal/WAL/SHM files — a missing or unreadable database is reported
+    # as a clean error below, not created.
+    try:
+        conn = get_readonly_connection()
+        try:
+            project = get_project(conn, args.project_id)
+            if project is None:
+                print(
+                    f"verify-artifacts: FAILED — no project found with project_id {args.project_id!r}",
+                    file=sys.stderr,
+                )
+                return 1
+            artifacts = list_artifacts_by_project(conn, args.project_id, kind=args.kind)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        print(f"verify-artifacts: FAILED — could not read artifact registry: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        manifest = load_manifest(Path(project.manifest_path))
+    except ManifestStoreError as exc:
+        print(f"verify-artifacts: FAILED — {exc}", file=sys.stderr)
+        return 1
+
+    # The project directory is the directory containing manifest.json —
+    # the same layout src/core/queue_import.py's create_project_from_inputs
+    # writes (<output_root>/<project_id>/manifest.json) — and every
+    # artifact's relative_path is verified as staying safely under it.
+    project_dir = Path(project.manifest_path).resolve().parent
+    results = verify_artifacts(project_dir, manifest, artifacts)
+
+    if not results:
+        kind_note = f" of kind {args.kind!r}" if args.kind else ""
+        print(
+            f"verify-artifacts: FAILED — no artifacts registered{kind_note} for project "
+            f"{args.project_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    ok = all(result.passed for result in results)
+
+    if out_format == "json":
+        payload = {
+            "read_only": True,
+            "project_id": project.project_id,
+            "kind_filter": args.kind,
+            "artifact_count": len(results),
+            "passed": ok,
+            "results": [result.model_dump(mode="json") for result in results],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_verify_artifacts_text(project.project_id, args.kind, results))
+
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -452,6 +562,17 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument("project_id")
     dry_run.add_argument("--format", default="text", help="Output format: text (default) or json")
     dry_run.set_defaults(func=cmd_dry_run)
+
+    verify_artifacts = sub.add_parser(
+        "verify-artifacts",
+        help="Read-only verification of an existing project's registered artifacts; writes nothing",
+    )
+    verify_artifacts.add_argument("project_id")
+    verify_artifacts.add_argument(
+        "--kind", choices=_ARTIFACT_KINDS, default=None, help="Only verify artifacts of this kind"
+    )
+    verify_artifacts.add_argument("--format", default="text", help="Output format: text (default) or json")
+    verify_artifacts.set_defaults(func=cmd_verify_artifacts)
 
     return parser
 
