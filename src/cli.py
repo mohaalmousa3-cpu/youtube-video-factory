@@ -27,13 +27,19 @@ artifact (fixed identity, no alternate takes), the one remaining local
 step verify-and-advance needs to advance a project into "audio_ready". It
 also never calls init_db() (same get_existing_connection() contract as
 verify-and-advance), never mutates the manifest, and never transitions a
-project's lifecycle stage itself. None of the new
+project's lifecycle stage itself. Phase 2E adds the analogous
+`register-visual-artifact` command (src/core/visual_artifact_registrar.py)
+for one PNG "visual" artifact per scene — same fixed-identity,
+registration-first, never-init_db(), never-mutates-the-manifest,
+stage-agnostic design as `register-audio-artifact`, validated with Pillow
+(already a pinned dependency) instead of ffprobe; PNG only, no Qwen-size
+restrictions. None of the new
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`
-is the only command that uses a renderer module (src/render/ffmpeg_render's
-local ffprobe wrapper, to measure a source file's real duration); every
-other command only reads local JSON files and reads/writes the local
-SQLite database.
+uses a renderer module (src/render/ffmpeg_render's local ffprobe wrapper,
+to measure a source file's real duration) and `register-visual-artifact`
+uses Pillow (to decode-validate a source image); every other command only
+reads local JSON files and reads/writes the local SQLite database.
 Error handling convention: every new command function catches its own
 domain errors and converts them to a short stderr message + non-zero exit
 code; none of them let a raw traceback reach the user, and none of them
@@ -705,6 +711,98 @@ def cmd_register_audio_artifact(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _render_register_visual_artifact_text(result) -> str:
+    status = "OK" if result.ok else "FAILED"
+    idempotent_note = " (idempotent no-op — nothing was written)" if result.idempotent else ""
+    lines = [
+        f"register-visual-artifact: {status}{idempotent_note} "
+        "(writes exactly one artifact row on a fresh registration; the manifest and "
+        "project lifecycle stage are never touched)",
+        f"project_id: {result.project_id}",
+        f"scene_id: {result.scene_id}",
+        f"artifact_id: {result.artifact_id}",
+        f"relative_path: {result.relative_path}",
+        f"copied: {result.copied}",
+        f"width: {result.width}",
+        f"height: {result.height}",
+        f"format: {result.image_format}",
+    ]
+    for reason in result.reasons:
+        lines.append(f"  - {reason}")
+    return "\n".join(lines)
+
+
+def cmd_register_visual_artifact(args: argparse.Namespace) -> int:
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.visual_artifact_registrar import VisualArtifactRegistrationError, register_visual_artifact
+    from src.database.db import get_existing_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"register-visual-artifact: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Never calls init_db(): a missing data directory or database file
+    # must fail cleanly here, not be created — same contract as
+    # verify-and-advance's/register-audio-artifact's get_existing_connection().
+    try:
+        conn = get_existing_connection()
+    except sqlite3.Error as exc:
+        print(f"register-visual-artifact: FAILED — no local project database found: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            print(
+                f"register-visual-artifact: FAILED — no project found with project_id {args.project_id!r}",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            manifest = load_manifest(Path(project.manifest_path))
+        except ManifestStoreError as exc:
+            print(f"register-visual-artifact: FAILED — {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            result = register_visual_artifact(conn, project, manifest, args.scene_id, Path(args.file))
+        except VisualArtifactRegistrationError as exc:
+            print(f"register-visual-artifact: FAILED — {exc}", file=sys.stderr)
+            return 1
+    except sqlite3.Error as exc:
+        print(f"register-visual-artifact: FAILED — {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    if out_format == "json":
+        payload = {
+            "project_id": result.project_id,
+            "scene_id": result.scene_id,
+            "artifact_id": result.artifact_id,
+            "relative_path": result.relative_path,
+            "ok": result.ok,
+            "idempotent": result.idempotent,
+            "copied": result.copied,
+            "width": result.width,
+            "height": result.height,
+            "format": result.image_format,
+            "reasons": list(result.reasons),
+            "artifact": result.artifact.model_dump(mode="json") if result.artifact is not None else None,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_register_visual_artifact_text(result))
+
+    return 0 if result.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -812,6 +910,17 @@ def build_parser() -> argparse.ArgumentParser:
     register_audio_artifact.add_argument("--file", required=True, help="Path to the local audio file to register")
     register_audio_artifact.add_argument("--format", default="text", help="Output format: text (default) or json")
     register_audio_artifact.set_defaults(func=cmd_register_audio_artifact)
+
+    register_visual_artifact = sub.add_parser(
+        "register-visual-artifact",
+        help="Register a locally produced PNG image as one scene's canonical visual artifact; "
+        "writes to SQLite (and copies the file) only on a fresh registration",
+    )
+    register_visual_artifact.add_argument("project_id")
+    register_visual_artifact.add_argument("--scene-id", required=True, help="Scene this visual artifact belongs to")
+    register_visual_artifact.add_argument("--file", required=True, help="Path to the local PNG image to register")
+    register_visual_artifact.add_argument("--format", default="text", help="Output format: text (default) or json")
+    register_visual_artifact.set_defaults(func=cmd_register_visual_artifact)
 
     return parser
 
