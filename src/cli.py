@@ -11,6 +11,7 @@ converts them to a short stderr message + non-zero exit code; none of them
 let a raw traceback reach the user, and none of them call sys.exit()
 themselves (only `main()`'s `raise SystemExit(main())` does that)."""
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -296,6 +297,92 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _render_dry_run_text(report) -> str:
+    lines = [
+        "dry-run: OK (read-only planning/reporting only)",
+        f"project_id: {report.project_id}",
+        f"manifest_path: {report.manifest_path}",
+        f"current_stage: {report.current_stage}",
+        f"last_successful_stage: {report.last_successful_stage}",
+        f"lifecycle_version: {report.lifecycle_version}",
+        f"transition_count: {report.transition_count}",
+        f"next_action: {report.execution_plan.next_action}",
+        f"next_stage: {report.execution_plan.next_stage}",
+        f"explanation: {report.execution_plan.explanation}",
+    ]
+    lines.append("requirements:")
+    for item in report.execution_plan.requirements:
+        lines.append(f"  - {item}")
+    lines.append("blocks:")
+    for item in report.execution_plan.blocks:
+        lines.append(f"  - {item}")
+    lines.append("warnings:")
+    for item in report.execution_plan.warnings:
+        lines.append(f"  - {item}")
+    lines.append("policy_decisions:")
+    for decision in report.policy_decisions:
+        lines.append(f"  - {decision.key}: {decision.status} ({decision.detail})")
+    lines.append("planned_steps:")
+    for step in report.execution_plan.planned_steps:
+        lines.append(
+            f"  - #{step.order} {step.stage} action={step.action} "
+            f"verification_required={step.verification_required}"
+        )
+    lines.append("non_invoked_integrations:")
+    for item in report.non_invoked_integrations:
+        lines.append(f"  - {item}")
+    return "\n".join(lines)
+
+
+def cmd_dry_run(args: argparse.Namespace) -> int:
+    from src.core.dry_run_orchestrator import DryRunOrchestratorError, build_dry_run_report
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project, list_project_transitions
+    from src.utils.channel_config import ChannelConfigError, get_channel_policy
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(f"dry-run: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')", file=sys.stderr)
+        return 1
+
+    # Strictly read-only: never init_db()/create the data directory, the
+    # database file, or its journal/WAL/SHM files — a missing or unreadable
+    # database is reported as a clean dry-run error below, not created.
+    try:
+        conn = get_readonly_connection()
+        try:
+            project = get_project(conn, args.project_id)
+            if project is None:
+                print(f"dry-run: FAILED — no project found with project_id {args.project_id!r}", file=sys.stderr)
+                return 1
+            transitions = list_project_transitions(conn, args.project_id)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        print(f"dry-run: FAILED — could not read project registry: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        manifest = load_manifest(Path(project.manifest_path))
+    except ManifestStoreError as exc:
+        print(f"dry-run: FAILED — {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        channel_policy = get_channel_policy()
+        report = build_dry_run_report(project, transitions, manifest, channel_policy)
+    except (ChannelConfigError, DryRunOrchestratorError) as exc:
+        print(f"dry-run: FAILED — {exc}", file=sys.stderr)
+        return 1
+
+    if out_format == "json":
+        print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_dry_run_text(report))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -358,6 +445,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_manifest.add_argument("path")
     validate_manifest.set_defaults(func=cmd_validate_manifest)
+
+    dry_run = sub.add_parser(
+        "dry-run", help="Read-only execution-plan inspection for an existing project; writes nothing"
+    )
+    dry_run.add_argument("project_id")
+    dry_run.add_argument("--format", default="text", help="Output format: text (default) or json")
+    dry_run.set_defaults(func=cmd_dry_run)
 
     return parser
 

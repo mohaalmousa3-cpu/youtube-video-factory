@@ -51,8 +51,12 @@ class Settings:
 
 @lru_cache
 def get_settings() -> Settings:
+    # Deliberately does NOT create data_dir here — this is a pure settings
+    # lookup, called from read-only paths (e.g. the dry-run CLI command)
+    # that must never create files/directories as a side effect. Callers
+    # that actually need data_dir to exist on disk (src/database/db.py's
+    # get_connection()) create it themselves right before writing.
     data_dir = PROJECT_ROOT / "data"
-    data_dir.mkdir(exist_ok=True)
     models_dir = PROJECT_ROOT / "models"
     return Settings(
         groq_api_key=os.environ.get("GROQ_API_KEY", ""),
