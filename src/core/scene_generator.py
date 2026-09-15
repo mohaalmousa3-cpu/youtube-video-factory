@@ -14,6 +14,15 @@ database access, no filesystem write, no manifest/artifact/stage-transition
 side effect of any kind; this module only ever returns a ScenePlan or
 raises SceneGenerationError.
 
+Phase 1E: every attempt is preceded by
+src.core.cost_guard.require_paid_approval("groq" | "tokenrouter", ...,
+is_paid=False) — both providers are currently documented free-tier, so this
+call is a no-op today (it never reads any file when is_paid=False), but it
+is the one guaranteed choke point a future paid-tier change would have to
+also flip is_paid at. A PaidApprovalRequiredError from that guard is never
+caught here — it propagates out of generate_scene_plan() immediately,
+distinct from the ordinary ProviderError retry/fallback path below.
+
 NEVER TRUSTED from the LLM: scene_id, sequence, approval_state, artifacts,
 role_outfit_id, text_overlays, sfx_refs, flow_task_id. Every one of those
 is assigned programmatically (scene_id/sequence from array position,
@@ -67,10 +76,12 @@ from typing import Any, Protocol
 
 from pydantic import ValidationError
 
+from src.core.cost_guard import require_paid_approval
 from src.models.scene import ScenePlan, ScenePlanItem
 from src.models.story import StoryInput
 from src.providers.base import ProviderError
 from src.utils.channel_config import ChannelPolicy
+from src.utils.config import get_settings
 
 _MAX_TOKENS = 2048
 
@@ -278,17 +289,33 @@ def generate_scene_plan(
                 raise ProviderError("TokenRouterProvider initialization failed") from exc
         return tokenrouter_provider
 
-    attempts: tuple[tuple[str, Any], ...] = (
-        ("GroqProvider", _get_groq),
-        ("GroqProvider", _get_groq),
-        ("TokenRouterProvider", _get_tokenrouter),
-        ("TokenRouterProvider", _get_tokenrouter),
+    # Phase 1E: canonical cost-guard service name travels alongside each
+    # attempt so the guard call below always names the provider it is
+    # actually about to construct/call, never inferred separately.
+    attempts: tuple[tuple[str, str, Any], ...] = (
+        ("GroqProvider", "groq", _get_groq),
+        ("GroqProvider", "groq", _get_groq),
+        ("TokenRouterProvider", "tokenrouter", _get_tokenrouter),
+        ("TokenRouterProvider", "tokenrouter", _get_tokenrouter),
     )
+
+    # Both current call sites are documented free-tier (CLAUDE.md's provider
+    # table), so is_paid=False here — require_paid_approval() returns
+    # immediately in that case without ever reading proposals_path. The path
+    # itself is only a placeholder value derived from the existing data_dir
+    # setting (same base directory jobs.db already uses); it is never
+    # created or opened by this free-tier path.
+    proposals_path = get_settings().data_dir / "paid_proposals.json"
 
     last_provider_name = ""
     last_reason = ""
-    for provider_name, get_provider in attempts:
+    for provider_name, service_name, get_provider in attempts:
         last_provider_name = provider_name
+        # Runs before provider construction and before generate(); raises
+        # PaidApprovalRequiredError (never a ProviderError) so a paid-service
+        # denial propagates out of generate_scene_plan() immediately instead
+        # of being folded into the ordinary retry/fallback loop below.
+        require_paid_approval(service_name, proposals_path, is_paid=False)
         try:
             provider = get_provider()
             raw_text = provider.generate(prompt, max_tokens=_MAX_TOKENS)

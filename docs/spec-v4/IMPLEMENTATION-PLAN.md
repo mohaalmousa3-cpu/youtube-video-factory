@@ -57,7 +57,11 @@ gap analysis is written, and `git status`/`git diff --stat` show only
   a corresponding `paid-proposal` record exists with `status: "approved"`.
 - Add a `paid-proposal` review workflow (even a manual one — e.g. a
   human reads and edits the JSON file's `status` field) before Phase 1E is
-  considered done; no automatic approval path.
+  considered done; no automatic approval path. **Done**: see
+  `data/paid_proposals.json.example` — a human copies it to
+  `data/paid_proposals.json` (gitignored, never created automatically) and
+  edits `status` to `"approved"` there; `src/core/cost_guard.py` enforces
+  that no automatic approval path exists.
 
 ## Explicit non-goals for all of the above
 

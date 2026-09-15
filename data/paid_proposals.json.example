@@ -1,0 +1,12 @@
+[
+  {
+    "proposal_id": "example-qwen-image-monthly-approval",
+    "service_name": "qwen-image",
+    "estimated_monthly_cost_usd": 5.0,
+    "justification": "EXAMPLE RECORD ONLY. Copy this file to data/paid_proposals.json (an operator-controlled local file, gitignored, never created automatically by any code) and edit your copy there. Only a record whose status is exactly \"approved\" permits a paid provider call for its service_name; this record's current status, \"proposed\", still blocks it, exactly like \"rejected\", \"expired\", or a missing, malformed, or unreadable data/paid_proposals.json file. There is no automatic approval path anywhere in this codebase: status must be changed to \"approved\" only by a human directly editing the local file. service_name must be exactly one of: groq, tokenrouter, kokoro, qwen-image; any other value is never recognized. Realistic reason a qwen-image proposal like this might exist: generate_with_reference() would be needed for character-consistent scene art if free-tier usage is ever exceeded.",
+    "status": "proposed",
+    "requires_explicit_user_approval": true,
+    "approved_by": null,
+    "approved_at": null
+  }
+]
