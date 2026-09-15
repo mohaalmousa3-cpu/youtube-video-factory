@@ -106,7 +106,17 @@ src/core/scene_image_prompt.build_scene_image_prompt(), and prints the
 exact final prompt a future generation call would use. It never opens or
 decodes --reference-image, never creates --output, never calls
 image_qwen.py or any other provider, and never writes SQLite or the
-manifest.
+manifest. `build-scene-image` (src/core/scene_image_generation.py) is that
+future command, now implemented: generation-only, it calls
+QwenImageProvider.generate_with_reference_and_download() — the first real,
+paid, network provider call reachable from this CLI — but only after every
+local check (project/manifest identity, scene lookup, --reference-image,
+--output) has passed AND require_paid_approval("qwen-image", proposals_path,
+is_paid=True) has succeeded; Qwen-Image is fixed as a paid service, never a
+CLI-settable option, so no invocation can declare its own way past the
+guard. It writes only the --output PNG (verified with Pillow afterward) —
+no SQLite write, no artifact registration, no manifest change; register
+the result separately with the existing, unmodified `register-visual-artifact`.
 None of the other
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`,
@@ -1297,6 +1307,142 @@ def cmd_preview_scene_image_prompt(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_scene_image(args: argparse.Namespace) -> int:
+    """Generation-only: build one scene's image via
+    QwenImageProvider.generate_with_reference_and_download() — the first
+    real (paid, network) generation call in this CLI. Writes only the
+    --output PNG file (via the provider) — no SQLite write, no artifact
+    registration, no manifest change, no lifecycle transition. Register
+    the result separately with register-visual-artifact (unchanged, run as
+    its own later step).
+
+    Qwen-Image is treated as a fixed paid service —
+    require_paid_approval("qwen-image", proposals_path, is_paid=True) is
+    called (inside src.core.scene_image_generation.build_scene_image())
+    before any provider construction; is_paid is never a CLI option, so no
+    invocation can declare its own way past the guard.
+    build_scene_image() itself still lets PaidApprovalRequiredError
+    propagate normally (unchanged) — it is this command, at the CLI
+    boundary only, that catches exactly that one exception type (never a
+    broad Exception) and reports it through the same _fail() text/JSON
+    convention as every other rejection below, with a short fixed message
+    that never echoes proposals_path, service_name interpolation beyond
+    the literal "qwen-image", provider response text, or a traceback.
+    Denial never results in constructing, calling, or falling back to any
+    provider.
+
+    Strictly read-only against SQLite: uses get_readonly_connection() (never
+    init_db()), same contract as every other generation-only command in this
+    CLI. The connection is closed before prompt construction, the cost
+    guard, or any provider work begins — src/core/scene_image_generation.py
+    imports nothing from src.database."""
+    from src.core.cost_guard import PaidApprovalRequiredError
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.scene_image_generation import SceneImageGenerationError, build_scene_image
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+    from src.utils.config import get_settings
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"build-scene-image: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {
+                "ok": False,
+                "project_id": args.project_id,
+                "scene_id": args.scene_id,
+                "reason": reason,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+        else:
+            print(f"build-scene-image: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    include_character_anchor = args.include_character == "true"
+    include_color_anchor = args.include_color_anchor == "true"
+
+    try:
+        conn = get_readonly_connection()
+    except sqlite3.Error:
+        return _fail("no local project database found")
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            return _fail(f"unknown project_id {args.project_id!r}")
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError:
+            return _fail("could not load manifest at --manifest (unreadable or invalid)")
+
+        if manifest.project_id != args.project_id:
+            return _fail(f"--manifest project_id does not match project_id {args.project_id!r}")
+        if manifest.source_fingerprint != project.manifest_fingerprint:
+            return _fail(
+                "--manifest source_fingerprint does not match the project registry's recorded fingerprint"
+            )
+
+        scene = next((s for s in manifest.scene_plan.scenes if s.scene_id == args.scene_id), None)
+        if scene is None:
+            return _fail(f"unknown scene_id {args.scene_id!r} in the provided manifest")
+    except sqlite3.Error:
+        # A DB read failure after the connection already opened
+        # successfully — distinct from get_readonly_connection() itself
+        # failing above, which already has its own specialized message.
+        return _fail("local project database could not be read")
+    finally:
+        conn.close()
+
+    reference_image_path = Path(args.reference_image)
+    output_path = Path(args.output)
+    proposals_path = (
+        Path(args.proposals_path) if args.proposals_path is not None else get_settings().data_dir / "paid_proposals.json"
+    )
+
+    try:
+        build_scene_image(
+            scene,
+            reference_image_path,
+            output_path,
+            proposals_path,
+            include_character_anchor=include_character_anchor,
+            include_color_anchor=include_color_anchor,
+        )
+    except PaidApprovalRequiredError:
+        return _fail("qwen-image is not approved for a paid provider call")
+    except SceneImageGenerationError as exc:
+        return _fail(str(exc))
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": args.project_id,
+            "scene_id": args.scene_id,
+            "output": str(output_path),
+            "reference_image": str(reference_image_path),
+            "include_character_anchor": include_character_anchor,
+            "include_color_anchor": include_color_anchor,
+            "registered": False,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("build-scene-image: OK (scene image generated; not registered)")
+        print(f"  project_id: {args.project_id}")
+        print(f"  scene_id: {args.scene_id}")
+        print(f"  output: {output_path}")
+        print(f"  reference_image: {reference_image_path}")
+        print(f"  include_character_anchor: {include_character_anchor}")
+        print(f"  include_color_anchor: {include_color_anchor}")
+    return 0
+
+
 def cmd_register_animation_artifact(args: argparse.Namespace) -> int:
     from src.core.animation_artifact_registrar import (
         AnimationArtifactRegistrationError,
@@ -1889,6 +2035,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     preview_scene_image_prompt.set_defaults(func=cmd_preview_scene_image_prompt)
+
+    build_scene_image = sub.add_parser(
+        "build-scene-image",
+        help="Generation-only: build one scene's image via "
+        "QwenImageProvider.generate_with_reference_and_download(), guarded by a fixed "
+        "is_paid=True require_paid_approval('qwen-image', ...) check; writes only the --output "
+        "PNG — no SQLite write, no artifact registration, no manifest change, no lifecycle "
+        "transition; register the result separately with register-visual-artifact",
+    )
+    build_scene_image.add_argument("project_id")
+    build_scene_image.add_argument("scene_id")
+    build_scene_image.add_argument(
+        "--manifest", required=True, help="Path to the manifest JSON identifying this project/scene"
+    )
+    build_scene_image.add_argument(
+        "--reference-image",
+        required=True,
+        help="Local path to the reference image conditioning generation; must exist and be a regular file",
+    )
+    build_scene_image.add_argument(
+        "--output", required=True, help="Path to save the generated PNG; must not already exist"
+    )
+    build_scene_image.add_argument(
+        "--include-character",
+        required=True,
+        choices=["true", "false"],
+        help="Whether to append CHARACTER_ANCHOR to the prompt; never inferred automatically",
+    )
+    build_scene_image.add_argument(
+        "--include-color-anchor",
+        default="true",
+        choices=["true", "false"],
+        help="Whether to append COLOR_ANCHOR to the prompt (default: true)",
+    )
+    build_scene_image.add_argument(
+        "--proposals-path",
+        default=None,
+        help="Path to the JSON paid-proposal records; defaults to <data_dir>/paid_proposals.json",
+    )
+    build_scene_image.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    build_scene_image.set_defaults(func=cmd_build_scene_image)
 
     return parser
 
