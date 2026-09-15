@@ -1021,6 +1021,127 @@ def _render_register_animation_artifact_text(result) -> str:
     return "\n".join(lines)
 
 
+def cmd_build_upscaled_ken_burns(args: argparse.Namespace) -> int:
+    """Phase 1D vertical slice, generation-only: build an upscale-assisted
+    Ken Burns MP4 clip for one scene from its already-registered visual
+    artifact and the caller-supplied enriched manifest's measured audio
+    duration. Writes only the --output MP4 file — no SQLite write, no
+    artifact registration, no manifest change, and no lifecycle
+    transition. Register the result separately with
+    register-animation-artifact (unchanged, run as its own later step).
+
+    Strictly read-only against SQLite: uses get_readonly_connection()
+    (never init_db()), same never-create-anything contract as
+    finalize-scene-timing/dry-run, and the connection is closed before the
+    local upscale/ffmpeg pipeline (src/core/ken_burns_upscale_pipeline.py)
+    is ever invoked."""
+    from src.core.ken_burns_upscale_pipeline import (
+        KenBurnsUpscalePipelineError,
+        build_upscaled_ken_burns_clip,
+    )
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.path_safety import resolve_under_project_dir
+    from src.database.artifact_repository import list_artifacts_by_scene
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"build-upscaled-ken-burns: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {
+                "ok": False,
+                "project_id": args.project_id,
+                "scene_id": args.scene_id,
+                "reason": reason,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+        else:
+            print(f"build-upscaled-ken-burns: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    output_path = Path(args.output)
+
+    try:
+        conn = get_readonly_connection()
+    except sqlite3.Error:
+        return _fail("no local project database found")
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            return _fail(f"unknown project_id {args.project_id!r}")
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError:
+            return _fail("could not load manifest at --manifest (unreadable or invalid)")
+
+        if manifest.project_id != args.project_id:
+            return _fail(f"--manifest project_id does not match project_id {args.project_id!r}")
+        if manifest.source_fingerprint != project.manifest_fingerprint:
+            return _fail(
+                "--manifest source_fingerprint does not match the project registry's recorded fingerprint"
+            )
+
+        scene = next((s for s in manifest.scene_plan.scenes if s.scene_id == args.scene_id), None)
+        if scene is None:
+            return _fail(f"unknown scene_id {args.scene_id!r} in the provided manifest")
+
+        visual_artifacts = [
+            a for a in list_artifacts_by_scene(conn, args.project_id, args.scene_id) if a.kind == "visual"
+        ]
+        if len(visual_artifacts) == 0:
+            return _fail(f"no registered visual artifact found for scene_id {args.scene_id!r}")
+        if len(visual_artifacts) > 1:
+            return _fail(
+                f"multiple registered visual artifacts found for scene_id {args.scene_id!r} "
+                "(expected exactly 1)"
+            )
+
+        project_dir_resolved = Path(project.manifest_path).resolve().parent
+        source_visual_path = resolve_under_project_dir(project_dir_resolved, visual_artifacts[0].relative_path)
+        if source_visual_path is None:
+            return _fail("registered visual artifact path is unsafe")
+        if not source_visual_path.exists():
+            return _fail("registered visual artifact file is missing on disk")
+        if not source_visual_path.is_file():
+            return _fail("registered visual artifact path is not a regular file")
+        if source_visual_path.stat().st_size == 0:
+            return _fail("registered visual artifact file is empty")
+    finally:
+        conn.close()
+
+    try:
+        build_upscaled_ken_burns_clip(scene, source_visual_path, output_path)
+    except KenBurnsUpscalePipelineError as exc:
+        return _fail(str(exc))
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": args.project_id,
+            "scene_id": args.scene_id,
+            "output": str(output_path),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(
+            "build-upscaled-ken-burns: OK (clip generated; not registered — "
+            "run register-animation-artifact separately)"
+        )
+        print(f"  project_id: {args.project_id}")
+        print(f"  scene_id: {args.scene_id}")
+        print(f"  output: {output_path}")
+    return 0
+
+
 def cmd_register_animation_artifact(args: argparse.Namespace) -> int:
     from src.core.animation_artifact_registrar import (
         AnimationArtifactRegistrationError,
@@ -1553,6 +1674,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     advance_project_stage.add_argument("--format", default="text", help="Output format: text (default) or json")
     advance_project_stage.set_defaults(func=cmd_advance_project_stage)
+
+    build_upscaled_ken_burns = sub.add_parser(
+        "build-upscaled-ken-burns",
+        help="Generation-only Phase 1D slice: build a local, upscale-assisted Ken Burns MP4 clip for "
+        "one scene from its already-registered visual artifact and the enriched manifest's measured "
+        "audio duration; writes only the --output MP4 — no SQLite write, no artifact registration, "
+        "no manifest change, no lifecycle transition; register the result separately with "
+        "register-animation-artifact",
+    )
+    build_upscaled_ken_burns.add_argument("project_id")
+    build_upscaled_ken_burns.add_argument("scene_id")
+    build_upscaled_ken_burns.add_argument(
+        "--manifest",
+        required=True,
+        help="Path to the enriched VideoManifest JSON (e.g. finalize-scene-timing's --output)",
+    )
+    build_upscaled_ken_burns.add_argument(
+        "--output", required=True, help="Path to save the generated MP4 clip; must not already exist"
+    )
+    build_upscaled_ken_burns.add_argument("--format", default="text", help="Output format: text (default) or json")
+    build_upscaled_ken_burns.set_defaults(func=cmd_build_upscaled_ken_burns)
 
     return parser
 
