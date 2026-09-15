@@ -1142,6 +1142,172 @@ def cmd_build_upscaled_ken_burns(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mouth_animation_preflight(args: argparse.Namespace) -> int:
+    """Read-only readiness check for a future mouth-animation generation
+    command: confirms exactly one registered visual and audio artifact
+    exist for the scene, that the visual image opens and the given
+    --mouth-box fits entirely inside it, and that Rhubarb is available.
+    Performs NO generation — no get_mouth_cues(), no
+    apply_mouth_animation(), no ffmpeg — and no SQLite write, artifact
+    registration, or manifest change.
+
+    Strictly read-only against SQLite: uses get_readonly_connection()
+    (never init_db()), same contract as finalize-scene-timing/dry-run/
+    build-upscaled-ken-burns. The connection is closed before either the
+    Pillow image check or the Rhubarb availability check runs — neither of
+    those touches SQLite (src/core/mouth_animation_preflight.py imports
+    nothing from src.database)."""
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.mouth_animation_preflight import (
+        MouthAnimationPreflightError,
+        check_rhubarb_available,
+        parse_mouth_box,
+        validate_image_and_box,
+    )
+    from src.core.path_safety import resolve_under_project_dir
+    from src.database.artifact_repository import list_artifacts_by_scene
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"mouth-animation-preflight: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {
+                "ok": False,
+                "project_id": args.project_id,
+                "scene_id": args.scene_id,
+                "reason": reason,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+        else:
+            print(f"mouth-animation-preflight: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        mouth_box = parse_mouth_box(args.mouth_box)
+    except MouthAnimationPreflightError as exc:
+        return _fail(str(exc))
+
+    try:
+        conn = get_readonly_connection()
+    except sqlite3.Error:
+        return _fail("no local project database found")
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            return _fail(f"unknown project_id {args.project_id!r}")
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError:
+            return _fail("could not load manifest at --manifest (unreadable or invalid)")
+
+        if manifest.project_id != args.project_id:
+            return _fail(f"--manifest project_id does not match project_id {args.project_id!r}")
+        if manifest.source_fingerprint != project.manifest_fingerprint:
+            return _fail(
+                "--manifest source_fingerprint does not match the project registry's recorded fingerprint"
+            )
+
+        scene = next((s for s in manifest.scene_plan.scenes if s.scene_id == args.scene_id), None)
+        if scene is None:
+            return _fail(f"unknown scene_id {args.scene_id!r} in the provided manifest")
+
+        project_dir_resolved = Path(project.manifest_path).resolve().parent
+
+        visual_artifacts = [
+            a for a in list_artifacts_by_scene(conn, args.project_id, args.scene_id) if a.kind == "visual"
+        ]
+        if len(visual_artifacts) == 0:
+            return _fail(f"no registered visual artifact found for scene_id {args.scene_id!r}")
+        if len(visual_artifacts) > 1:
+            return _fail(
+                f"multiple registered visual artifacts found for scene_id {args.scene_id!r} "
+                "(expected exactly 1)"
+            )
+        visual_artifact = visual_artifacts[0]
+        source_visual_path = resolve_under_project_dir(project_dir_resolved, visual_artifact.relative_path)
+        if source_visual_path is None:
+            return _fail("registered visual artifact path is unsafe")
+        if not source_visual_path.exists():
+            return _fail("registered visual artifact file is missing on disk")
+        if not source_visual_path.is_file():
+            return _fail("registered visual artifact path is not a regular file")
+        if source_visual_path.stat().st_size == 0:
+            return _fail("registered visual artifact file is empty")
+
+        audio_artifacts = [
+            a for a in list_artifacts_by_scene(conn, args.project_id, args.scene_id) if a.kind == "audio"
+        ]
+        if len(audio_artifacts) == 0:
+            return _fail(f"no registered audio artifact found for scene_id {args.scene_id!r}")
+        if len(audio_artifacts) > 1:
+            return _fail(
+                f"multiple registered audio artifacts found for scene_id {args.scene_id!r} "
+                "(expected exactly 1)"
+            )
+        audio_artifact = audio_artifacts[0]
+        source_audio_path = resolve_under_project_dir(project_dir_resolved, audio_artifact.relative_path)
+        if source_audio_path is None:
+            return _fail("registered audio artifact path is unsafe")
+        if not source_audio_path.exists():
+            return _fail("registered audio artifact file is missing on disk")
+        if not source_audio_path.is_file():
+            return _fail("registered audio artifact path is not a regular file")
+        if source_audio_path.stat().st_size == 0:
+            return _fail("registered audio artifact file is empty")
+    except sqlite3.Error:
+        # A DB read failure after the connection already opened
+        # successfully (e.g. disk corruption mid-read) — distinct from
+        # get_readonly_connection() itself failing above, which already
+        # has its own specialized "no local project database found"
+        # message. Never the underlying sqlite3 exception text.
+        return _fail("local project database could not be read")
+    finally:
+        conn.close()
+
+    try:
+        image_width, image_height = validate_image_and_box(source_visual_path, mouth_box)
+        check_rhubarb_available()
+    except MouthAnimationPreflightError as exc:
+        return _fail(str(exc))
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": args.project_id,
+            "scene_id": args.scene_id,
+            "visual_relative_path": visual_artifact.relative_path,
+            "audio_relative_path": audio_artifact.relative_path,
+            "image_width": image_width,
+            "image_height": image_height,
+            "mouth_box": {
+                "center_x": mouth_box.center_x,
+                "center_y": mouth_box.center_y,
+                "width": mouth_box.width,
+                "height": mouth_box.height,
+            },
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("mouth-animation-preflight: OK — preflight passed; no mouth-animation generation performed")
+        print(f"  project_id: {args.project_id}")
+        print(f"  scene_id: {args.scene_id}")
+        print(f"  visual: {visual_artifact.relative_path}")
+        print(f"  audio: {audio_artifact.relative_path}")
+        print(f"  image_size: {image_width}x{image_height}")
+        print(f"  mouth_box: {mouth_box.center_x},{mouth_box.center_y},{mouth_box.width},{mouth_box.height}")
+    return 0
+
+
 def cmd_register_animation_artifact(args: argparse.Namespace) -> int:
     from src.core.animation_artifact_registrar import (
         AnimationArtifactRegistrationError,
@@ -1695,6 +1861,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_upscaled_ken_burns.add_argument("--format", default="text", help="Output format: text (default) or json")
     build_upscaled_ken_burns.set_defaults(func=cmd_build_upscaled_ken_burns)
+
+    mouth_animation_preflight = sub.add_parser(
+        "mouth-animation-preflight",
+        help="Read-only readiness check for mouth-animation generation on one scene: confirms exactly "
+        "one registered visual and audio artifact exist, the image opens and the given --mouth-box "
+        "fits entirely inside it, and Rhubarb is available; performs no generation, no ffmpeg/Rhubarb "
+        "invocation beyond a health check, no database write, and no artifact registration",
+    )
+    mouth_animation_preflight.add_argument("project_id")
+    mouth_animation_preflight.add_argument("scene_id")
+    mouth_animation_preflight.add_argument(
+        "--manifest", required=True, help="Path to the manifest JSON identifying this project/scene"
+    )
+    mouth_animation_preflight.add_argument(
+        "--mouth-box",
+        required=True,
+        help="CENTER_X,CENTER_Y,WIDTH,HEIGHT — hand-measured mouth rectangle for this scene image",
+    )
+    mouth_animation_preflight.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    mouth_animation_preflight.set_defaults(func=cmd_mouth_animation_preflight)
 
     return parser
 
