@@ -56,7 +56,18 @@ after existing structural verification of both the render and qc_report
 artifacts already passed, it additionally re-reads the verified qc_report
 FILE (never the mutable ArtifactRecord.metadata) and requires its
 `passed` to be strictly True before the transition is allowed — every
-other target stage is unaffected. None of the new
+other target stage is unaffected. Phase 2I adds `advance-project-stage`
+(src/core/stage_advance_service.py) — the non-verification counterpart to
+`verify-and-advance`: it performs exactly one guarded transition into one
+of the six forward stages that claim NO completed/measured work
+(audio_pending, visuals_pending, animation_pending, render_pending,
+qc_pending, ready_for_manual_publish), always with verified=False. Every
+other forward target — audio_ready, visuals_ready, animation_ready,
+rendered, qc_passed, and completed — stays exclusively behind
+`verify-and-advance`; `advance-project-stage` rejects all of them (plus
+`archived`/`failed`, unclaimed by any command) before ever calling
+transition_project(). Same get_existing_connection()/single-guarded-write
+contract as `verify-and-advance`. None of the new
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`,
 `register-animation-artifact`, and `register-render-artifact` use a
@@ -76,6 +87,7 @@ import sys
 from pathlib import Path
 from typing import get_args
 
+from src.core.stage_advance_service import NON_VERIFICATION_TARGET_STAGES
 from src.core.verified_transition_service import SUPPORTED_TARGET_STAGES
 from src.database.db import init_db
 from src.models.enums import ArtifactKind
@@ -1100,6 +1112,82 @@ def cmd_register_qc_report_artifact(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _render_advance_project_stage_text(result) -> str:
+    lines = [
+        "advance-project-stage: "
+        + ("OK" if result.approved and result.db_committed else "FAILED")
+        + " (writes to SQLite only on success; never an artifact file, manifest, or queue file; "
+        "never a verification-required stage — those stay behind verify-and-advance)",
+        f"project_id: {result.project_id}",
+        f"from_stage: {result.from_stage}",
+        f"to_stage: {result.to_stage}",
+        f"approved: {result.approved}",
+        f"db_committed: {result.db_committed}",
+        f"lifecycle_version_before: {result.lifecycle_version_before}",
+        f"lifecycle_version_after: {result.lifecycle_version_after}",
+    ]
+    for reason in result.reasons:
+        lines.append(f"  - {reason}")
+    return "\n".join(lines)
+
+
+def cmd_advance_project_stage(args: argparse.Namespace) -> int:
+    from src.core.stage_advance_service import advance_project_stage
+    from src.database.db import get_existing_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"advance-project-stage: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Never calls init_db(): a missing data directory or database file
+    # must fail cleanly here, not be created — same contract as
+    # verify-and-advance's get_existing_connection().
+    try:
+        conn = get_existing_connection()
+    except sqlite3.Error as exc:
+        print(f"advance-project-stage: FAILED — no local project database found: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            print(
+                f"advance-project-stage: FAILED — no project found with project_id {args.project_id!r}",
+                file=sys.stderr,
+            )
+            return 1
+
+        result = advance_project_stage(conn, project, args.to, reason=args.reason)
+    except sqlite3.Error as exc:
+        print(f"advance-project-stage: FAILED — {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    if out_format == "json":
+        payload = {
+            "project_id": result.project_id,
+            "from_stage": result.from_stage,
+            "to_stage": result.to_stage,
+            "reason": result.reason,
+            "approved": result.approved,
+            "db_committed": result.db_committed,
+            "reasons": list(result.reasons),
+            "lifecycle_version_before": result.lifecycle_version_before,
+            "lifecycle_version_after": result.lifecycle_version_after,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_advance_project_stage_text(result))
+
+    return 0 if result.approved and result.db_committed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -1257,6 +1345,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     register_qc_report_artifact.set_defaults(func=cmd_register_qc_report_artifact)
+
+    advance_project_stage = sub.add_parser(
+        "advance-project-stage",
+        help="Perform exactly one guarded, non-verification transition (no completed/measured-work "
+        "claim) — audio_ready, visuals_ready, animation_ready, rendered, qc_passed, completed, "
+        "archived, and failed are all rejected here; use verify-and-advance for those",
+    )
+    advance_project_stage.add_argument("project_id")
+    advance_project_stage.add_argument(
+        "--to",
+        required=True,
+        choices=sorted(NON_VERIFICATION_TARGET_STAGES),
+        help="Target non-verification lifecycle stage to advance into",
+    )
+    advance_project_stage.add_argument(
+        "--reason", default=None, help="Optional note for this transition's audit trail"
+    )
+    advance_project_stage.add_argument("--format", default="text", help="Output format: text (default) or json")
+    advance_project_stage.set_defaults(func=cmd_advance_project_stage)
 
     return parser
 
