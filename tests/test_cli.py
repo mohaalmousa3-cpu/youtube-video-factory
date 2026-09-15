@@ -1,7 +1,10 @@
 """Tests for src/cli.py's Phase 1E commands: validate-input, create-project,
 import-queue, list-projects, status, resume-plan, validate-manifest — plus
-a registration-only check that `health`/`init-db` are unchanged. No
-network, no provider call (cmd_health itself is never invoked).
+a registration-only check that `init-db` is unchanged, and (further below)
+cmd_health's Phase 1E cost-guard wiring. Every provider class/health_check
+function cmd_health touches is faked or monkeypatched in every test that
+actually invokes it — no real provider object, real network call, or real
+local model/binary invocation anywhere in this file.
 
 Command handlers are called directly with a plain argparse.Namespace,
 never via subprocess, per the "independently testable" requirement. Every
@@ -84,15 +87,15 @@ def _write_scenes_only(tmp_path, **overrides):
 
 
 # ---------------------------------------------------------------------
-# health / init-db unchanged
+# health / init-db registration
 # ---------------------------------------------------------------------
 
 
-def test_health_and_init_db_remain_registered_without_executing_health():
+def test_health_and_init_db_remain_registered():
     parser = cli.build_parser()
 
     health_args = parser.parse_args(["health"])
-    assert health_args.func is cli.cmd_health  # never actually called — no provider contact
+    assert health_args.func is cli.cmd_health
 
     init_db_args = parser.parse_args(["init-db"])
     assert init_db_args.func is cli.cmd_init_db
@@ -534,3 +537,186 @@ def test_cmd_import_queue_bad_queue_file_returns_error(isolated_db, tmp_path, ca
 
     assert rc == 1
     assert "FAILED" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------
+# Phase 1E: cmd_health's cost-guard wiring — require_paid_approval() runs
+# before GroqProvider/TokenRouterProvider/QwenImageProvider construction
+# and health_check(); a denial propagates out of cmd_health() immediately
+# rather than being folded into an ordinary "FAILED" health-check result
+# by _check()'s broad except. Every provider class and local-tool
+# health_check function is faked/monkeypatched in every test below that
+# actually invokes cmd_health — no real provider object, network call, or
+# local model/binary invocation anywhere here.
+# ---------------------------------------------------------------------
+
+
+class _FakeHealthyProvider:
+    def health_check(self):
+        return True
+
+
+def _explode_if_constructed(*args, **kwargs):
+    raise AssertionError("must never be constructed once the cost guard has already denied")
+
+
+def _patch_all_local_tools_healthy(monkeypatch):
+    monkeypatch.setattr("src.providers.lipsync_rhubarb.health_check", lambda: True)
+    monkeypatch.setattr("src.providers.image_upscale.health_check", lambda: True)
+    monkeypatch.setattr("src.render.manim_render.health_check", lambda: True)
+    monkeypatch.setattr("src.render.ffmpeg_render.health_check", lambda: True)
+
+
+def test_health_paid_approval_denial_on_groq_blocks_construction_and_propagates(monkeypatch):
+    from src.core.cost_guard import PaidApprovalRequiredError
+
+    calls = []
+
+    def _fake_require(service_name, proposals_path, *, is_paid):
+        calls.append((service_name, is_paid))
+        raise PaidApprovalRequiredError("denied")
+
+    monkeypatch.setattr("src.core.cost_guard.require_paid_approval", _fake_require)
+    monkeypatch.setattr("src.providers.llm_groq.GroqProvider", _explode_if_constructed)
+    monkeypatch.setattr("src.providers.llm_tokenrouter.TokenRouterProvider", _explode_if_constructed)
+    monkeypatch.setattr("src.providers.tts_kokoro.KokoroProvider", _explode_if_constructed)
+    monkeypatch.setattr("src.providers.image_qwen.QwenImageProvider", _explode_if_constructed)
+
+    with pytest.raises(PaidApprovalRequiredError):
+        cli.cmd_health(argparse.Namespace())
+
+    assert calls == [("groq", False)]
+
+
+def test_health_paid_approval_denial_on_tokenrouter_blocks_construction_and_propagates(monkeypatch):
+    from src.core.cost_guard import PaidApprovalRequiredError
+
+    calls = []
+
+    def _fake_require(service_name, proposals_path, *, is_paid):
+        calls.append((service_name, is_paid))
+        if service_name == "tokenrouter":
+            raise PaidApprovalRequiredError("denied")
+
+    monkeypatch.setattr("src.core.cost_guard.require_paid_approval", _fake_require)
+    monkeypatch.setattr("src.providers.llm_groq.GroqProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.llm_tokenrouter.TokenRouterProvider", _explode_if_constructed)
+    monkeypatch.setattr("src.providers.tts_kokoro.KokoroProvider", _explode_if_constructed)
+    monkeypatch.setattr("src.providers.image_qwen.QwenImageProvider", _explode_if_constructed)
+
+    with pytest.raises(PaidApprovalRequiredError):
+        cli.cmd_health(argparse.Namespace())
+
+    assert calls == [("groq", False), ("tokenrouter", False)]
+
+
+def test_health_paid_approval_denial_on_qwen_image_blocks_construction_and_propagates(monkeypatch):
+    from src.core.cost_guard import PaidApprovalRequiredError
+
+    calls = []
+
+    def _fake_require(service_name, proposals_path, *, is_paid):
+        calls.append((service_name, is_paid))
+        if service_name == "qwen-image":
+            raise PaidApprovalRequiredError("denied")
+
+    monkeypatch.setattr("src.core.cost_guard.require_paid_approval", _fake_require)
+    monkeypatch.setattr("src.providers.llm_groq.GroqProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.llm_tokenrouter.TokenRouterProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.tts_kokoro.KokoroProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.image_qwen.QwenImageProvider", _explode_if_constructed)
+
+    with pytest.raises(PaidApprovalRequiredError):
+        cli.cmd_health(argparse.Namespace())
+
+    assert calls == [("groq", False), ("tokenrouter", False), ("qwen-image", False)]
+
+
+def test_health_guard_called_with_exact_service_names_and_is_paid_false(monkeypatch):
+    calls = []
+
+    def _spy_require(service_name, proposals_path, *, is_paid):
+        calls.append((service_name, is_paid))
+
+    monkeypatch.setattr("src.core.cost_guard.require_paid_approval", _spy_require)
+    monkeypatch.setattr("src.providers.llm_groq.GroqProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.llm_tokenrouter.TokenRouterProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.tts_kokoro.KokoroProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.image_qwen.QwenImageProvider", _FakeHealthyProvider)
+    _patch_all_local_tools_healthy(monkeypatch)
+
+    rc = cli.cmd_health(argparse.Namespace())
+
+    assert rc == 0
+    # Exactly three guard calls — Kokoro/Rhubarb/Real-ESRGAN/Manim/FFmpeg
+    # are local/self-hosted and are never guarded.
+    assert calls == [("groq", False), ("tokenrouter", False), ("qwen-image", False)]
+
+
+def test_health_normal_output_still_works_with_non_raising_guard(monkeypatch, caplog):
+    monkeypatch.setattr("src.core.cost_guard.require_paid_approval", lambda *a, **k: None)
+    monkeypatch.setattr("src.providers.llm_groq.GroqProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.llm_tokenrouter.TokenRouterProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.tts_kokoro.KokoroProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.image_qwen.QwenImageProvider", _FakeHealthyProvider)
+    _patch_all_local_tools_healthy(monkeypatch)
+
+    with caplog.at_level("INFO", logger="video_factory"):
+        rc = cli.cmd_health(argparse.Namespace())
+
+    assert rc == 0
+    assert "Groq (LLM): OK" in caplog.text
+    assert "TokenRouter (LLM fallback): OK" in caplog.text
+    assert "Qwen-Image (backgrounds/character): OK" in caplog.text
+    assert "Health check PASSED" in caplog.text
+
+
+def test_health_ordinary_failure_still_reported_not_swallowed_as_approval_denial(monkeypatch, caplog):
+    """An unrelated health-check failure (e.g. a real network/auth error)
+    must still be reported as an ordinary FAILED line by _check(), exactly
+    as before this wiring — not confused with, or masked by, a guard
+    denial."""
+
+    class _FailingProvider:
+        def health_check(self):
+            raise RuntimeError("simulated network failure")
+
+    monkeypatch.setattr("src.core.cost_guard.require_paid_approval", lambda *a, **k: None)
+    monkeypatch.setattr("src.providers.llm_groq.GroqProvider", _FailingProvider)
+    monkeypatch.setattr("src.providers.llm_tokenrouter.TokenRouterProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.tts_kokoro.KokoroProvider", _FakeHealthyProvider)
+    monkeypatch.setattr("src.providers.image_qwen.QwenImageProvider", _FakeHealthyProvider)
+    _patch_all_local_tools_healthy(monkeypatch)
+
+    with caplog.at_level("INFO", logger="video_factory"):
+        rc = cli.cmd_health(argparse.Namespace())
+
+    assert rc == 1
+    assert "Groq (LLM): FAILED (simulated network failure)" in caplog.text
+    assert "Health check FAILED" in caplog.text
+
+
+def test_health_real_guard_never_creates_or_requires_a_proposals_file(tmp_path, monkeypatch):
+    """Exercises the real, unmocked require_paid_approval() against a
+    genuinely nonexistent proposals file to prove cmd_health's specific
+    is_paid=False wiring never reads or creates it — only the provider
+    classes/local-tool functions below are faked, to avoid any real
+    network or local model/binary call."""
+    from src.utils import config
+
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    config.get_settings.cache_clear()
+    try:
+        monkeypatch.setattr("src.providers.llm_groq.GroqProvider", _FakeHealthyProvider)
+        monkeypatch.setattr("src.providers.llm_tokenrouter.TokenRouterProvider", _FakeHealthyProvider)
+        monkeypatch.setattr("src.providers.tts_kokoro.KokoroProvider", _FakeHealthyProvider)
+        monkeypatch.setattr("src.providers.image_qwen.QwenImageProvider", _FakeHealthyProvider)
+        _patch_all_local_tools_healthy(monkeypatch)
+
+        rc = cli.cmd_health(argparse.Namespace())
+
+        assert rc == 0
+        proposals_path = tmp_path / "data" / "paid_proposals.json"
+        assert not proposals_path.exists()
+    finally:
+        config.get_settings.cache_clear()

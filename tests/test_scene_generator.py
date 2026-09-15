@@ -646,3 +646,120 @@ def test_real_providers_are_never_constructed_when_fakes_are_supplied(monkeypatc
     groq = _FakeProvider([_valid_response(1)])
     plan = generate_scene_plan(_story_input(), _channel_policy(), groq_provider=groq, tokenrouter_provider=_FakeProvider([]))
     assert len(plan.scenes) == 1
+
+
+# ---------------------------------------------------------------------
+# Phase 1E: cost-guard wiring — require_paid_approval() runs before every
+# real .generate() call, for both providers, and a denial propagates
+# unmodified rather than being folded into the ordinary ProviderError
+# retry/fallback path. No live provider or network call in any test below.
+# ---------------------------------------------------------------------
+
+
+def test_paid_approval_denial_on_groq_blocks_before_any_generate_call(monkeypatch):
+    from src.core.cost_guard import PaidApprovalRequiredError
+
+    calls = []
+
+    def _fake_require(service_name, proposals_path, *, is_paid):
+        calls.append((service_name, is_paid))
+        raise PaidApprovalRequiredError("denied")
+
+    monkeypatch.setattr("src.core.scene_generator.require_paid_approval", _fake_require)
+
+    groq = _FakeProvider([_valid_response(1)])
+    tokenrouter = _FakeProvider([_valid_response(1)])
+
+    with pytest.raises(PaidApprovalRequiredError):
+        generate_scene_plan(_story_input(), _channel_policy(), groq_provider=groq, tokenrouter_provider=tokenrouter)
+
+    assert len(groq.calls) == 0
+    assert len(tokenrouter.calls) == 0
+    assert calls == [("groq", False)]
+
+
+def test_paid_approval_denial_on_tokenrouter_blocks_before_generate_after_groq_exhausted(monkeypatch):
+    from src.core.cost_guard import PaidApprovalRequiredError
+
+    calls = []
+
+    def _fake_require(service_name, proposals_path, *, is_paid):
+        calls.append((service_name, is_paid))
+        if service_name == "tokenrouter":
+            raise PaidApprovalRequiredError("denied")
+
+    monkeypatch.setattr("src.core.scene_generator.require_paid_approval", _fake_require)
+
+    groq = _FakeProvider([ProviderError("down"), ProviderError("still down")])
+    tokenrouter = _FakeProvider([_valid_response(1)])
+
+    with pytest.raises(PaidApprovalRequiredError):
+        generate_scene_plan(_story_input(), _channel_policy(), groq_provider=groq, tokenrouter_provider=tokenrouter)
+
+    assert len(groq.calls) == 2
+    assert len(tokenrouter.calls) == 0
+    assert calls == [("groq", False), ("groq", False), ("tokenrouter", False)]
+
+
+def test_guard_called_with_exact_service_names_and_is_paid_false_on_success(monkeypatch):
+    calls = []
+
+    def _spy_require(service_name, proposals_path, *, is_paid):
+        calls.append((service_name, is_paid))
+
+    monkeypatch.setattr("src.core.scene_generator.require_paid_approval", _spy_require)
+
+    groq = _FakeProvider([_valid_response(2)])
+    tokenrouter = _FakeProvider([])
+
+    plan = generate_scene_plan(_story_input(), _channel_policy(), groq_provider=groq, tokenrouter_provider=tokenrouter)
+
+    assert len(plan.scenes) == 2
+    assert len(groq.calls) == 1
+    assert calls == [("groq", False)]
+
+
+def test_guard_called_with_exact_service_names_through_tokenrouter_fallback(monkeypatch):
+    """Also re-proves the existing ProviderError -> TokenRouter fallback
+    behavior still works with the guard wired in (unmocked cost_guard
+    logic would behave identically here; this spy just makes the exact
+    call sequence explicit)."""
+    calls = []
+
+    def _spy_require(service_name, proposals_path, *, is_paid):
+        calls.append((service_name, is_paid))
+
+    monkeypatch.setattr("src.core.scene_generator.require_paid_approval", _spy_require)
+
+    groq = _FakeProvider([ProviderError("down"), ProviderError("still down")])
+    tokenrouter = _FakeProvider([_valid_response(1)])
+
+    plan = generate_scene_plan(_story_input(), _channel_policy(), groq_provider=groq, tokenrouter_provider=tokenrouter)
+
+    assert len(plan.scenes) == 1
+    assert len(groq.calls) == 2
+    assert len(tokenrouter.calls) == 1
+    assert calls == [("groq", False), ("groq", False), ("tokenrouter", False)]
+
+
+def test_real_guard_never_creates_or_requires_a_proposals_file_for_free_calls(tmp_path, monkeypatch):
+    """Exercises the real, unmocked require_paid_approval() (not a fake) to
+    prove end-to-end that the is_paid=False wiring never reads or creates
+    any proposals file — only the provider fakes below are fake."""
+    from src.utils import config
+
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    config.get_settings.cache_clear()
+    try:
+        groq = _FakeProvider([_valid_response(1)])
+        tokenrouter = _FakeProvider([])
+
+        plan = generate_scene_plan(
+            _story_input(), _channel_policy(), groq_provider=groq, tokenrouter_provider=tokenrouter
+        )
+
+        assert len(plan.scenes) == 1
+        proposals_path = tmp_path / "data" / "paid_proposals.json"
+        assert not proposals_path.exists()
+    finally:
+        config.get_settings.cache_clear()

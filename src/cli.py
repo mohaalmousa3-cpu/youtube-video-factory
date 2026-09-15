@@ -96,7 +96,18 @@ or save_manifest() is ever called) if it resolves to the project's own
 canonical manifest_path (a normalized, case-folded-on-Windows
 Path.resolve() comparison that does not require either path to already
 exist), so the project's original manifest can never be silently
-overwritten in place. No database write, no provider, no ffprobe call. None of the other
+overwritten in place. No database write, no provider, no ffprobe call. `preview-scene-image-prompt` (src/core/scene_image_preview.py) is a
+read-only preview for a not-yet-implemented future `build-scene-image`
+command: given a project/scene and a local --reference-image/--output path
+pair, it loads the scene's visual_brief from the manifest (same
+get_readonly_connection()/identity-check contract as every other
+generation-only command), applies the already-shipped, pure
+src/core/scene_image_prompt.build_scene_image_prompt(), and prints the
+exact final prompt a future generation call would use. It never opens or
+decodes --reference-image, never creates --output, never calls
+image_qwen.py or any other provider, and never writes SQLite or the
+manifest.
+None of the other
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`,
 `register-animation-artifact`, and `register-render-artifact` use a
@@ -137,25 +148,49 @@ def _check(logger, label: str, check) -> bool:
 
 
 def cmd_health(_args: argparse.Namespace) -> int:
+    """Phase 1E: Groq/TokenRouter/Qwen-Image's health_check() each make a
+    real network request (Kokoro/Rhubarb/Real-ESRGAN/Manim/FFmpeg do not —
+    self-hosted/local only, no guard needed), so each is preceded by its
+    own require_paid_approval(..., is_paid=False) call — same canonical
+    names and is_paid=False convention src/core/scene_generator.py already
+    uses. Each guard call is a standalone statement, deliberately outside
+    _check()'s try/except: _check() catches plain Exception, which would
+    otherwise silently fold a PaidApprovalRequiredError into an ordinary
+    "FAILED" line for just that one provider. Left unguarded, it propagates
+    out of cmd_health() immediately, before that provider is even
+    constructed and before any later provider in this list is checked."""
     logger = setup_logging()
 
+    from src.core.cost_guard import require_paid_approval
     from src.providers.llm_groq import GroqProvider
     from src.providers.llm_tokenrouter import TokenRouterProvider
     from src.providers.tts_kokoro import KokoroProvider
     from src.providers.image_qwen import QwenImageProvider
     from src.providers import lipsync_rhubarb, image_upscale
     from src.render import manim_render, ffmpeg_render
+    from src.utils.config import get_settings
 
-    results = [
-        _check(logger, "Groq (LLM)", GroqProvider().health_check),
-        _check(logger, "TokenRouter (LLM fallback)", TokenRouterProvider().health_check),
-        _check(logger, "Kokoro (TTS)", KokoroProvider().health_check),
-        _check(logger, "Qwen-Image (backgrounds/character)", QwenImageProvider().health_check),
-        _check(logger, "Rhubarb (lip sync)", lipsync_rhubarb.health_check),
-        _check(logger, "Real-ESRGAN (upscale)", image_upscale.health_check),
-        _check(logger, "Manim (supporting animation)", manim_render.health_check),
-        _check(logger, "FFmpeg (render)", ffmpeg_render.health_check),
-    ]
+    # Placeholder only, like scene_generator.py's — never opened/created
+    # while is_paid=False (require_paid_approval returns before touching it).
+    proposals_path = get_settings().data_dir / "paid_proposals.json"
+
+    results = []
+
+    require_paid_approval("groq", proposals_path, is_paid=False)
+    results.append(_check(logger, "Groq (LLM)", GroqProvider().health_check))
+
+    require_paid_approval("tokenrouter", proposals_path, is_paid=False)
+    results.append(_check(logger, "TokenRouter (LLM fallback)", TokenRouterProvider().health_check))
+
+    results.append(_check(logger, "Kokoro (TTS)", KokoroProvider().health_check))
+
+    require_paid_approval("qwen-image", proposals_path, is_paid=False)
+    results.append(_check(logger, "Qwen-Image (backgrounds/character)", QwenImageProvider().health_check))
+
+    results.append(_check(logger, "Rhubarb (lip sync)", lipsync_rhubarb.health_check))
+    results.append(_check(logger, "Real-ESRGAN (upscale)", image_upscale.health_check))
+    results.append(_check(logger, "Manim (supporting animation)", manim_render.health_check))
+    results.append(_check(logger, "FFmpeg (render)", ffmpeg_render.health_check))
 
     ok = all(results)
     logger.info("Health check %s", "PASSED" if ok else "FAILED")
@@ -1142,6 +1177,126 @@ def cmd_build_upscaled_ken_burns(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preview_scene_image_prompt(args: argparse.Namespace) -> int:
+    """Read-only: preview the exact image-generation prompt a future
+    build-scene-image command would use for one scene, without calling any
+    image provider. Loads the scene's visual_brief from the existing
+    project/manifest records (same identity checks as every prior
+    generation-only command), validates --reference-image and --output as
+    plain local paths (existence only — never opened/decoded, never
+    created), and assembles the final prompt via the already-shipped,
+    provider-free build_scene_image_prompt(). Performs no generation, no
+    download, no file write, no SQLite write, no artifact registration, and
+    no lifecycle transition.
+
+    Strictly read-only against SQLite: uses get_readonly_connection() (never
+    init_db()), same contract as every prior generation-only/read-only
+    command in this CLI. The connection is closed before any core preview
+    work begins — src/core/scene_image_preview.py imports nothing from
+    src.database or any provider module."""
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.scene_image_preview import ScenePreviewError, build_scene_image_preview
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"preview-scene-image-prompt: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {
+                "ok": False,
+                "project_id": args.project_id,
+                "scene_id": args.scene_id,
+                "reason": reason,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+        else:
+            print(f"preview-scene-image-prompt: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    include_character_anchor = args.include_character == "true"
+    include_color_anchor = args.include_color_anchor == "true"
+
+    try:
+        conn = get_readonly_connection()
+    except sqlite3.Error:
+        return _fail("no local project database found")
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            return _fail(f"unknown project_id {args.project_id!r}")
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError:
+            return _fail("could not load manifest at --manifest (unreadable or invalid)")
+
+        if manifest.project_id != args.project_id:
+            return _fail(f"--manifest project_id does not match project_id {args.project_id!r}")
+        if manifest.source_fingerprint != project.manifest_fingerprint:
+            return _fail(
+                "--manifest source_fingerprint does not match the project registry's recorded fingerprint"
+            )
+
+        scene = next((s for s in manifest.scene_plan.scenes if s.scene_id == args.scene_id), None)
+        if scene is None:
+            return _fail(f"unknown scene_id {args.scene_id!r} in the provided manifest")
+    except sqlite3.Error:
+        # A DB read failure after the connection already opened
+        # successfully — distinct from get_readonly_connection() itself
+        # failing above, which already has its own specialized message.
+        return _fail("local project database could not be read")
+    finally:
+        conn.close()
+
+    reference_image_path = Path(args.reference_image)
+    planned_output_path = Path(args.output)
+
+    try:
+        preview = build_scene_image_preview(
+            args.project_id,
+            scene,
+            reference_image_path,
+            planned_output_path,
+            include_character_anchor=include_character_anchor,
+            include_color_anchor=include_color_anchor,
+        )
+    except ScenePreviewError as exc:
+        return _fail(str(exc))
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": preview.project_id,
+            "scene_id": preview.scene_id,
+            "visual_brief": preview.visual_brief,
+            "final_prompt": preview.final_prompt,
+            "reference_image_path": str(preview.reference_image_path),
+            "planned_output_path": str(preview.planned_output_path),
+            "include_character_anchor": preview.include_character_anchor,
+            "include_color_anchor": preview.include_color_anchor,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("preview-scene-image-prompt: OK — prompt preview only; no image generated")
+        print(f"PROJECT_ID: {preview.project_id}")
+        print(f"SCENE_ID: {preview.scene_id}")
+        print(f"INCLUDE_CHARACTER_ANCHOR: {preview.include_character_anchor}")
+        print(f"INCLUDE_COLOR_ANCHOR: {preview.include_color_anchor}")
+        print(f"REFERENCE_IMAGE: {preview.reference_image_path}")
+        print(f"PLANNED_OUTPUT: {preview.planned_output_path}")
+        print("FINAL_PROMPT:")
+        print(preview.final_prompt)
+    return 0
+
+
 def cmd_register_animation_artifact(args: argparse.Namespace) -> int:
     from src.core.animation_artifact_registrar import (
         AnimationArtifactRegistrationError,
@@ -1695,6 +1850,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_upscaled_ken_burns.add_argument("--format", default="text", help="Output format: text (default) or json")
     build_upscaled_ken_burns.set_defaults(func=cmd_build_upscaled_ken_burns)
+
+    preview_scene_image_prompt = sub.add_parser(
+        "preview-scene-image-prompt",
+        help="Read-only: preview the exact scene-image generation prompt for one scene without "
+        "calling any image provider; loads visual_brief from the existing project/manifest records "
+        "and applies build_scene_image_prompt(); no generation, no download, no file write, no "
+        "SQLite write, no artifact registration, no lifecycle transition",
+    )
+    preview_scene_image_prompt.add_argument("project_id")
+    preview_scene_image_prompt.add_argument("scene_id")
+    preview_scene_image_prompt.add_argument(
+        "--manifest", required=True, help="Path to the manifest JSON identifying this project/scene"
+    )
+    preview_scene_image_prompt.add_argument(
+        "--reference-image",
+        required=True,
+        help="Local path to the reference image this preview assumes; existence only checked, never opened",
+    )
+    preview_scene_image_prompt.add_argument(
+        "--output",
+        required=True,
+        help="Planned future output path; must not already exist (never created by this command)",
+    )
+    preview_scene_image_prompt.add_argument(
+        "--include-character",
+        required=True,
+        choices=["true", "false"],
+        help="Whether to append CHARACTER_ANCHOR to the prompt; never inferred automatically",
+    )
+    preview_scene_image_prompt.add_argument(
+        "--include-color-anchor",
+        default="true",
+        choices=["true", "false"],
+        help="Whether to append COLOR_ANCHOR to the prompt (default: true)",
+    )
+    preview_scene_image_prompt.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    preview_scene_image_prompt.set_defaults(func=cmd_preview_scene_image_prompt)
 
     return parser
 
