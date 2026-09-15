@@ -79,7 +79,24 @@ text_overlays/sfx_refs/flow_task_id are always assigned programmatically,
 never trusted from the model. It never creates a project, manifest,
 artifact, or stage transition — with `--output` it saves the ScenePlan as
 JSON (src/core/scene_plan_store.py, no database access); without it, only
-a summary is printed. None of the other
+a summary is printed. `finalize-scene-timing`
+(src/core/scene_timing_finalizer.py) completes the other half of
+documented Phase 1C: reading a project's manifest and its already-registered
+"audio" ArtifactRecords (Phase 2D) strictly read-only
+(get_readonly_connection(), never init_db()), it populates every scene's
+measured_audio_duration_seconds from that already-ffprobe-measured
+metadata — all-or-nothing across every scene, no fallback estimate, and
+never touching VideoManifest.measured_audio_duration_seconds (the
+whole-video aggregate, deliberately left untouched). project_id and
+source_fingerprint are preserved exactly (model_copy(update=...) only,
+never build_video_manifest()/_compute_fingerprint()). The result is saved
+to a required `--output` path (src/core/manifest_store.save_manifest(),
+atomic write) — `--output` is explicitly rejected (before finalize_scene_timing()
+or save_manifest() is ever called) if it resolves to the project's own
+canonical manifest_path (a normalized, case-folded-on-Windows
+Path.resolve() comparison that does not require either path to already
+exist), so the project's original manifest can never be silently
+overwritten in place. No database write, no provider, no ffprobe call. None of the other
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`,
 `register-animation-artifact`, and `register-render-artifact` use a
@@ -94,6 +111,7 @@ call sys.exit() themselves (only `main()`'s `raise SystemExit(main())`
 does that)."""
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -212,6 +230,102 @@ def cmd_generate_scenes(args: argparse.Namespace) -> int:
         print(f"  scene_count: {len(scene_plan.scenes)}")
         for scene in scene_plan.scenes:
             print(f"  - {scene.scene_id} [{scene.scene_type}/{scene.motion_mode}]: {scene.narration_text}")
+    return 0
+
+
+def cmd_finalize_scene_timing(args: argparse.Namespace) -> int:
+    from src.core.manifest_store import ManifestStoreError, load_manifest, save_manifest
+    from src.core.scene_timing_finalizer import TimingFinalizationError, finalize_scene_timing
+    from src.database.artifact_repository import list_artifacts_by_project
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    # Strictly read-only: never init_db()/create the data directory, the
+    # database file, or its journal/WAL/SHM files — same contract as
+    # dry-run's get_readonly_connection(). This command never writes to
+    # SQLite under any circumstance.
+    try:
+        conn = get_readonly_connection()
+    except sqlite3.Error as exc:
+        print(f"finalize-scene-timing: FAILED — no local project database found: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            print(
+                f"finalize-scene-timing: FAILED — no project found with project_id {args.project_id!r}",
+                file=sys.stderr,
+            )
+            return 1
+        audio_artifacts = list_artifacts_by_project(conn, args.project_id, kind="audio")
+    except sqlite3.Error as exc:
+        print(f"finalize-scene-timing: FAILED — {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    try:
+        manifest = load_manifest(Path(project.manifest_path))
+    except ManifestStoreError as exc:
+        print(f"finalize-scene-timing: FAILED — {exc}", file=sys.stderr)
+        return 1
+
+    if manifest.project_id != args.project_id:
+        print(
+            f"finalize-scene-timing: FAILED — manifest project_id {manifest.project_id!r} "
+            f"does not match project {args.project_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+    if manifest.source_fingerprint != project.manifest_fingerprint:
+        print(
+            "finalize-scene-timing: FAILED — manifest source_fingerprint does not match the "
+            "project registry's recorded fingerprint",
+            file=sys.stderr,
+        )
+        return 1
+
+    # --output must be a separate, explicit destination — never the
+    # project's own canonical manifest_path. Path.resolve() (default
+    # strict=False) safely normalizes both sides without requiring either
+    # to exist (a fresh --output path, or one whose parent directory
+    # doesn't exist yet, is the normal case, not an error); os.path.normcase()
+    # additionally folds case on case-insensitive filesystems (Windows),
+    # a no-op elsewhere. A symlink/reparse-point that could only be
+    # resolved by something not yet on disk (e.g. --output's own
+    # not-yet-created parent turning out to be a symlink later) is not,
+    # and cannot be, detected here — see this command's own review notes.
+    output_resolved = os.path.normcase(str(Path(args.output).resolve()))
+    manifest_path_resolved = os.path.normcase(str(Path(project.manifest_path).resolve()))
+    if output_resolved == manifest_path_resolved:
+        print(
+            "finalize-scene-timing: FAILED — --output must not be the project's own canonical "
+            "manifest path; choose a separate destination for the enriched copy",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        enriched = finalize_scene_timing(manifest, audio_artifacts)
+    except TimingFinalizationError as exc:
+        print(f"finalize-scene-timing: FAILED — {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        save_manifest(enriched, Path(args.output))
+    except ManifestStoreError as exc:
+        print(f"finalize-scene-timing: FAILED — {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        "finalize-scene-timing: OK (per-scene measured_audio_duration_seconds populated from "
+        "already-registered audio artifacts; manifest-level measured_audio_duration_seconds left "
+        "unchanged; no database write, no artifact registration, no stage transition)"
+    )
+    print(f"  project_id: {enriched.project_id}")
+    print(f"  scene_count: {len(enriched.scene_plan.scenes)}")
+    print(f"  output: {args.output}")
     return 0
 
 
@@ -1268,6 +1382,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to save the generated ScenePlan JSON (default: print a summary only)",
     )
     generate_scenes.set_defaults(func=cmd_generate_scenes)
+
+    finalize_scene_timing = sub.add_parser(
+        "finalize-scene-timing",
+        help="Populate each scene's measured_audio_duration_seconds from already-registered "
+        "'audio' artifacts (Phase 2D) into a copy of the project's manifest, saved to --output; "
+        "all-or-nothing across every scene, no database write, no provider/ffprobe call",
+    )
+    finalize_scene_timing.add_argument("project_id")
+    finalize_scene_timing.add_argument(
+        "--output", required=True, help="Path to save the enriched VideoManifest JSON"
+    )
+    finalize_scene_timing.set_defaults(func=cmd_finalize_scene_timing)
 
     create_project = sub.add_parser(
         "create-project",
