@@ -67,7 +67,19 @@ rendered, qc_passed, and completed — stays exclusively behind
 `verify-and-advance`; `advance-project-stage` rejects all of them (plus
 `archived`/`failed`, unclaimed by any command) before ever calling
 transition_project(). Same get_existing_connection()/single-guarded-write
-contract as `verify-and-advance`. None of the new
+contract as `verify-and-advance`. `generate-scenes`
+(src/core/scene_generator.py) completes docs/spec-v4/IMPLEMENTATION-PLAN.md's
+Phase 1C: given a local StoryInput file, it calls GroqProvider (primary)
+then TokenRouterProvider (fallback) — up to two attempts each, four total —
+to produce a fully validated ScenePlan. Every LLM-supplied field is
+content only (narration_text, scene_type, narrative_beat, visual_brief,
+motion_mode, with "manual_flow" excluded); scene_id/sequence/
+approval_state ("draft", never auto-approved)/artifacts/role_outfit_id/
+text_overlays/sfx_refs/flow_task_id are always assigned programmatically,
+never trusted from the model. It never creates a project, manifest,
+artifact, or stage transition — with `--output` it saves the ScenePlan as
+JSON (src/core/scene_plan_store.py, no database access); without it, only
+a summary is printed. None of the other
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`,
 `register-animation-artifact`, and `register-render-artifact` use a
@@ -163,6 +175,43 @@ def cmd_validate_input(args: argparse.Namespace) -> int:
     print(f"  project_id: {manifest.project_id}")
     print(f"  scene_count: {len(manifest.scene_plan.scenes)}")
     print(f"  target_duration_seconds: {manifest.target_duration_seconds}")
+    return 0
+
+
+def cmd_generate_scenes(args: argparse.Namespace) -> int:
+    from src.core.queue_import import InputFileError, load_story_input_file
+    from src.core.scene_generator import SceneGenerationError, generate_scene_plan
+    from src.utils.channel_config import ChannelConfigError, get_channel_policy
+
+    try:
+        story_input = load_story_input_file(Path(args.story))
+        channel_policy = get_channel_policy()
+        scene_plan = generate_scene_plan(story_input, channel_policy)
+    except (InputFileError, ChannelConfigError, SceneGenerationError) as exc:
+        print(f"generate-scenes: FAILED — {exc}", file=sys.stderr)
+        return 1
+
+    if args.output:
+        from src.core.scene_plan_store import ScenePlanStoreError, save_scene_plan
+
+        try:
+            save_scene_plan(scene_plan, Path(args.output))
+        except ScenePlanStoreError as exc:
+            print(f"generate-scenes: FAILED — {exc}", file=sys.stderr)
+            return 1
+        print(
+            "generate-scenes: OK (no project, manifest, artifact, or stage transition was created)"
+        )
+        print(f"  scene_count: {len(scene_plan.scenes)}")
+        print(f"  output: {args.output}")
+    else:
+        print(
+            "generate-scenes: OK (nothing was saved; no project, manifest, artifact, or stage "
+            "transition was created)"
+        )
+        print(f"  scene_count: {len(scene_plan.scenes)}")
+        for scene in scene_plan.scenes:
+            print(f"  - {scene.scene_id} [{scene.scene_type}/{scene.motion_mode}]: {scene.narration_text}")
     return 0
 
 
@@ -1205,6 +1254,20 @@ def build_parser() -> argparse.ArgumentParser:
     validate_input.add_argument("--story", required=True, help="Path to a StoryInput JSON file")
     validate_input.add_argument("--scenes", required=True, help="Path to a ScenePlan JSON file")
     validate_input.set_defaults(func=cmd_validate_input)
+
+    generate_scenes = sub.add_parser(
+        "generate-scenes",
+        help="Generate a validated ScenePlan from a local StoryInput JSON file via GroqProvider "
+        "(TokenRouterProvider fallback) — no project, manifest, artifact, or stage transition is "
+        "created; with --output the plan is saved as JSON, otherwise only a summary is printed",
+    )
+    generate_scenes.add_argument("--story", required=True, help="Path to the local StoryInput JSON file")
+    generate_scenes.add_argument(
+        "--output",
+        default=None,
+        help="Optional path to save the generated ScenePlan JSON (default: print a summary only)",
+    )
+    generate_scenes.set_defaults(func=cmd_generate_scenes)
 
     create_project = sub.add_parser(
         "create-project",
