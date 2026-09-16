@@ -27,22 +27,31 @@ COLOR_ANCHOR = (
 )
 
 CHARACTER_ANCHOR = (
-    "A recurring male stick-figure protagonist with a consistent, recognizable "
-    "character design across every scene: a simple round head, two small dot "
-    "eyes, a minimal short curved mouth, a thin straight-line body, "
-    "equal-length thin line arms and legs, and consistent adult proportions. "
-    "Keep the same head-to-body ratio, limb thickness, height, face placement, "
-    "and simple line-art style in every scene. The character must remain "
-    "clearly male and visually identical from scene to scene.\n\n"
-    "Clothing, accessories, held objects, pose, expression, background, "
-    "lighting, and scene-specific color palette may change when required by "
-    "the story."
+    "A recurring adult male stick-figure protagonist with a consistent, "
+    "recognizable character design across every scene: a round, pale "
+    "gray-blue subtly shaded head with a thick black cartoon outline; "
+    "oversized round white eyes with black pupils; thick curved dark "
+    "eyebrows; a compact dark-charcoal subtly tapered torso; equal-length "
+    "thin dark-charcoal line arms and legs; dark-charcoal rounded mitten-like "
+    "hands and flat rounded shoe-like feet. Render the character in thick "
+    "black cartoon outlines as a clean 2D cartoon illustration — never 3D "
+    "and never photorealistic. Keep the same head-to-body ratio, limb "
+    "thickness, height, face placement, color palette, and overall character "
+    "design in every scene. The character must remain clearly male and "
+    "visually identical from scene to scene.\n\n"
+    "Clothing, accessories, held objects, pose, and expression may change "
+    "when required by the story, but must preserve the character's core "
+    "silhouette, proportions, face design, and dark-charcoal body palette."
 )
 
 SAFETY_SUFFIX = (
-    "No text, captions, speech bubbles, watermarks, logos, UI elements, "
-    "duplicate characters, extra arms, extra legs, malformed limbs, "
-    "photorealistic humans, or realistic facial details."
+    "The entire scene, including the background, must be a cohesive clean 2D "
+    "cartoon illustration; do not mix a cartoon character with a "
+    "photorealistic environment, photographic lighting, or photographic "
+    "depth of field. No text, captions, speech bubbles, watermarks, logos, "
+    "UI elements, duplicate characters, extra arms, extra legs, malformed "
+    "limbs, photorealistic humans, realistic facial details, 3D rendering, "
+    "or live-action photography."
 )
 
 
