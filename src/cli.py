@@ -117,6 +117,17 @@ CLI-settable option, so no invocation can declare its own way past the
 guard. It writes only the --output PNG (verified with Pillow afterward) —
 no SQLite write, no artifact registration, no manifest change; register
 the result separately with the existing, unmodified `register-visual-artifact`.
+`build-scene-audio` (src/core/scene_audio_generation.py) is analogous for
+narration audio: generation-only, it calls KokoroProvider.synthesize() —
+self-hosted, local TTS, no network call — after every local check
+(project/manifest identity, scene lookup, --output) has passed AND
+require_paid_approval("kokoro", proposals_path, is_paid=False) has
+succeeded; kept even though Kokoro is genuinely free, for the same
+consistency reason every other real provider call site in this CLI is
+wired through the guard. It writes only the --output WAV (verified with
+the existing ffprobe-based duration helper afterward) — no SQLite write,
+no artifact registration, no manifest change; register the result
+separately with the existing, unmodified `register-audio-artifact`.
 None of the other
 commands call a provider, an LLM, TTS, image
 generation, Flow, Veo, YouTube, or any remote service — `register-audio-artifact`,
@@ -1443,6 +1454,148 @@ def cmd_build_scene_image(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_scene_audio(args: argparse.Namespace) -> int:
+    """Generation-only: build one scene's narration audio via
+    KokoroProvider.synthesize() — self-hosted, local TTS, no network call.
+    Writes only the --output WAV file (via the provider) — no SQLite
+    write, no artifact registration, no manifest change, no lifecycle
+    transition. Register the result separately with
+    register-audio-artifact (unchanged, run as its own later step).
+
+    Kokoro is treated as a fixed free service —
+    require_paid_approval("kokoro", proposals_path, is_paid=False) is
+    called (inside src.core.scene_audio_generation.build_scene_audio())
+    before any provider construction, kept for the same consistency reason
+    every other currently-reachable real provider call site in this CLI is
+    wired through it. A PaidApprovalRequiredError from that call is never
+    caught inside the core module — it is caught here, at the CLI
+    boundary only, and reported through the same _fail() text/JSON
+    convention as every other rejection below (matching
+    cmd_build_scene_image's own corrected convention), never left to
+    propagate as a raw exception.
+
+    Strictly read-only against SQLite: uses get_readonly_connection() (never
+    init_db()), same contract as every other generation-only command in this
+    CLI. The connection is closed before any core work begins —
+    src/core/scene_audio_generation.py imports nothing from src.database."""
+    from src.core.cost_guard import PaidApprovalRequiredError
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.scene_audio_generation import SceneAudioGenerationError, build_scene_audio
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+    from src.providers.tts_kokoro import (
+        DEFAULT_VOICE,
+        DOCUMENTARY_CLAUSE_PAUSE,
+        DOCUMENTARY_SENTENCE_PAUSE,
+        DOCUMENTARY_SPEED,
+    )
+    from src.utils.config import get_settings
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"build-scene-audio: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {
+                "ok": False,
+                "project_id": args.project_id,
+                "scene_id": args.scene_id,
+                "reason": reason,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+        else:
+            print(f"build-scene-audio: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    voice = args.voice if args.voice is not None else DEFAULT_VOICE
+    try:
+        speed = float(args.speed) if args.speed is not None else DOCUMENTARY_SPEED
+        sentence_pause = float(args.sentence_pause) if args.sentence_pause is not None else DOCUMENTARY_SENTENCE_PAUSE
+        clause_pause = float(args.clause_pause) if args.clause_pause is not None else DOCUMENTARY_CLAUSE_PAUSE
+    except ValueError:
+        return _fail("--speed/--sentence-pause/--clause-pause must be valid decimal numbers")
+
+    try:
+        conn = get_readonly_connection()
+    except sqlite3.Error:
+        return _fail("no local project database found")
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            return _fail(f"unknown project_id {args.project_id!r}")
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError:
+            return _fail("could not load manifest at --manifest (unreadable or invalid)")
+
+        if manifest.project_id != args.project_id:
+            return _fail(f"--manifest project_id does not match project_id {args.project_id!r}")
+        if manifest.source_fingerprint != project.manifest_fingerprint:
+            return _fail(
+                "--manifest source_fingerprint does not match the project registry's recorded fingerprint"
+            )
+
+        scene = next((s for s in manifest.scene_plan.scenes if s.scene_id == args.scene_id), None)
+        if scene is None:
+            return _fail(f"unknown scene_id {args.scene_id!r} in the provided manifest")
+    except sqlite3.Error:
+        # A DB read failure after the connection already opened
+        # successfully — distinct from get_readonly_connection() itself
+        # failing above, which already has its own specialized message.
+        return _fail("local project database could not be read")
+    finally:
+        conn.close()
+
+    output_path = Path(args.output)
+    proposals_path = get_settings().data_dir / "paid_proposals.json"
+
+    try:
+        build_scene_audio(
+            scene,
+            output_path,
+            proposals_path,
+            voice=voice,
+            speed=speed,
+            sentence_pause=sentence_pause,
+            clause_pause=clause_pause,
+        )
+    except PaidApprovalRequiredError:
+        return _fail("kokoro is not approved for a paid provider call")
+    except SceneAudioGenerationError as exc:
+        return _fail(str(exc))
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": args.project_id,
+            "scene_id": args.scene_id,
+            "output": str(output_path),
+            "voice": voice,
+            "speed": speed,
+            "sentence_pause": sentence_pause,
+            "clause_pause": clause_pause,
+            "registered": False,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("build-scene-audio: OK (scene audio generated; not registered)")
+        print(f"  project_id: {args.project_id}")
+        print(f"  scene_id: {args.scene_id}")
+        print(f"  output: {output_path}")
+        print(f"  voice: {voice}")
+        print(f"  speed: {speed}")
+        print(f"  sentence_pause: {sentence_pause}")
+        print(f"  clause_pause: {clause_pause}")
+    return 0
+
+
 def cmd_register_animation_artifact(args: argparse.Namespace) -> int:
     from src.core.animation_artifact_registrar import (
         AnimationArtifactRegistrationError,
@@ -2078,6 +2231,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     build_scene_image.set_defaults(func=cmd_build_scene_image)
+
+    build_scene_audio = sub.add_parser(
+        "build-scene-audio",
+        help="Generation-only: build one scene's narration audio via KokoroProvider.synthesize() "
+        "(self-hosted, local, no network), guarded by a fixed is_paid=False "
+        "require_paid_approval('kokoro', ...) check; writes only the --output WAV — no SQLite "
+        "write, no artifact registration, no manifest change, no lifecycle transition; register "
+        "the result separately with register-audio-artifact",
+    )
+    build_scene_audio.add_argument("project_id")
+    build_scene_audio.add_argument("scene_id")
+    build_scene_audio.add_argument(
+        "--manifest", required=True, help="Path to the manifest JSON identifying this project/scene"
+    )
+    build_scene_audio.add_argument(
+        "--output", required=True, help="Path to save the generated WAV; must not already exist"
+    )
+    build_scene_audio.add_argument(
+        "--voice", default=None, help="Kokoro voice id; defaults to tts_kokoro.DEFAULT_VOICE"
+    )
+    build_scene_audio.add_argument(
+        "--speed", default=None, help="Speech speed multiplier; defaults to tts_kokoro.DOCUMENTARY_SPEED"
+    )
+    build_scene_audio.add_argument(
+        "--sentence-pause",
+        default=None,
+        help="Pause duration between sentences; defaults to tts_kokoro.DOCUMENTARY_SENTENCE_PAUSE",
+    )
+    build_scene_audio.add_argument(
+        "--clause-pause",
+        default=None,
+        help="Pause duration between clauses; defaults to tts_kokoro.DOCUMENTARY_CLAUSE_PAUSE",
+    )
+    build_scene_audio.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    build_scene_audio.set_defaults(func=cmd_build_scene_audio)
 
     return parser
 
