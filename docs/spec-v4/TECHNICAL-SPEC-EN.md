@@ -107,15 +107,16 @@ which are never read by the render pipeline and never reach a viewer.
 - `motion.require_local_fallback_for_manual_flow: true` — every video must
   be fully producible end-to-end using only the local/free pipeline: Ken
   Burns pan/zoom via `ffmpeg_render.ken_burns_clip` (`in`, `out`,
-  `pan_lr`, `pan_up`, `static`). Programmatic mouth/limb rigging
-  (`character_rig.py`'s `apply_mouth_animation()` / `apply_limb_sway()` /
-  `apply_mouth_and_limb_animation()`) is deliberately not part of this
-  local fallback — it remains in the repository, fully tested, but
-  deferred from the active roadmap (see `IMPLEMENTATION-PLAN.md`). Manual
-  Flow is an optional, human-operated handoff to Google Flow — never
-  required, never performed locally, and never approximated by local
-  animation code; when a human chooses to use it, it is additive polish on
-  top of a video that is already complete without it.
+  `pan_lr`, `pan_up`, `static`). Programmatic mouth/limb rigging via
+  `character_rig.py`'s `apply_mouth_animation()` and `apply_limb_sway()`
+  remains in the repository, fully tested, but is deferred from the
+  active roadmap and is not scheduled to be wired into any build — it is
+  deliberately not part of this local fallback (see
+  `IMPLEMENTATION-PLAN.md`). Manual Flow is an optional, human-operated
+  handoff to Google Flow — never required, never performed locally, and
+  never approximated by local animation code; when a human chooses to use
+  it, it is additive polish on top of a video that is already complete
+  without it.
 - A `manual-flow-task` record (see schema) is how an optional Flow step is
   requested and tracked; it must never carry a hard deadline that blocks
   publication, and the pipeline must produce a valid final video whether or
@@ -188,11 +189,11 @@ This spec adds a layer; it does not rewrite `src/providers/` or
   the `build-upscaled-ken-burns` CLI command, committed as `bf94d23`).
   Registering the resulting clip as an artifact remains a separate,
   explicit, later step (`register-animation-artifact`), not part of that
-  generation call. `character_rig.py`'s `apply_mouth_animation()` /
-  `apply_limb_sway()` / `apply_mouth_and_limb_animation()` are also fully
-  tested, but are explicitly deferred from the active roadmap (see
-  `IMPLEMENTATION-PLAN.md` Phase 1D) — they remain in the repository
-  untouched, not scheduled for wiring.
+  generation call. Programmatic mouth/limb rigging via `character_rig.py`'s
+  `apply_mouth_animation()` and `apply_limb_sway()` remains in the
+  repository, fully tested, but is deferred from the active roadmap and
+  is not scheduled to be wired into any build (see
+  `IMPLEMENTATION-PLAN.md` Phase 1D).
 
 ## 11. Non-goals for this document
 

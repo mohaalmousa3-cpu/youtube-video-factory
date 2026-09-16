@@ -45,14 +45,11 @@ gap analysis is written, and `git status`/`git diff --stat` show only
 - Wire `image_upscale.upscale_image()` into the Ken Burns path (per
   `CLAUDE.md`: "not wired into any `videoN_build.py` yet").
 - **Deferred from the active roadmap** (decision recorded 2026-09-17):
-  `character_rig.py`'s `apply_mouth_animation()` / `apply_limb_sway()` /
-  `apply_mouth_and_limb_animation()`, `src/core/mouth_animation_generation.py`,
-  `limb_sway_generation.py`, `composite_scene_generation.py`, and their
-  `build-mouth-animated-clip` / `build-limb-sway-clip` /
-  `build-composite-scene-clip` CLI commands remain in the repository,
-  fully tested, and untouched, but are not scheduled to be wired into any
-  build. Local motion stays Ken Burns only (`in`, `out`, `pan_lr`,
-  `pan_up`, `static`).
+  programmatic mouth/limb rigging via `character_rig.py`'s
+  `apply_mouth_animation()` and `apply_limb_sway()` remains in the
+  repository, fully tested, but is deferred from the active roadmap and
+  is not scheduled to be wired into any build. Local motion stays Ken
+  Burns only (`in`, `out`, `pan_lr`, `pan_up`, `static`).
 - Apply `COLOR_ANCHOR` + `CHARACTER_ANCHOR` to every scene prompt per the
   character-identity-lock policy (§9 of `TECHNICAL-SPEC-EN.md`).
 
