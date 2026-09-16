@@ -50,7 +50,57 @@ class MouthBox:
 
 
 def draw_mouth(base: Image.Image, box: MouthBox, viseme: str) -> Image.Image:
-    frame = base.copy()
+    """Draws over `base`'s own static mouth line before drawing the new
+    viseme — without this, a viseme narrower/shorter than the original
+    mouth (e.g. the closed "X"/"A" shapes) leaves the original line
+    visible around it, a double-mouth artifact. A first version sized the
+    erase patch to exactly the hand-measured MouthBox with a 3-5% margin
+    left for the blur's own falloff — the original line still bled through
+    near the box edges, because that margin was blurred away *from* full
+    opacity rather than being extra coverage *beyond* the box. Fixed by:
+    (1) sizing the patch 20% larger than the box in each dimension, so the
+    erase region overshoots the box on every side instead of stopping
+    exactly at it; (2) keeping the un-blurred solid core out to 99% of
+    that already-enlarged patch (not just 97% of the box itself), so the
+    blur's falloff happens almost entirely in the new 20%-larger margin,
+    away from the box interior; edges still feather into transparency at
+    the very outside via a blurred elliptical alpha mask (same technique
+    as rotate_limb()), so the patch blends into the surrounding face
+    rather than reading as a flat seam."""
+    frame = base.copy().convert("RGBA")
+    patch_width = round(box.width * 1.2)
+    patch_height = round(box.height * 1.2)
+    left = box.center_x - patch_width // 2
+    top = box.center_y - patch_height // 2
+
+    # Average several points around the enlarged patch instead of trusting
+    # one single pixel — a lone sample can land on an anti-aliased edge or
+    # a stray fleck of texture and paint the whole patch the wrong color.
+    rgb_frame = frame.convert("RGB")
+    img_w, img_h = rgb_frame.size
+
+    def _clamp(value, lo, hi):
+        return max(lo, min(value, hi))
+
+    sample_points = [
+        (_clamp(box.center_x, 0, img_w - 1), _clamp(top - 4, 0, img_h - 1)),
+        (_clamp(box.center_x - patch_width // 4, 0, img_w - 1), _clamp(top - 4, 0, img_h - 1)),
+        (_clamp(box.center_x + patch_width // 4, 0, img_w - 1), _clamp(top - 4, 0, img_h - 1)),
+        (_clamp(left - 4, 0, img_w - 1), _clamp(box.center_y, 0, img_h - 1)),
+        (_clamp(left + patch_width + 4, 0, img_w - 1), _clamp(box.center_y, 0, img_h - 1)),
+    ]
+    samples = [rgb_frame.getpixel(p) for p in sample_points]
+    patch_color = tuple(sum(channel) // len(samples) for channel in zip(*samples))
+
+    patch = Image.new("RGBA", (patch_width, patch_height), patch_color + (255,))
+    mask = Image.new("L", (patch_width, patch_height), 0)
+    ImageDraw.Draw(mask).ellipse(
+        [patch_width * 0.01, patch_height * 0.01, patch_width * 0.99, patch_height * 0.99], fill=255
+    )
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=3))
+    patch.putalpha(mask)
+    frame.alpha_composite(patch, dest=(left, top))
+
     draw = ImageDraw.Draw(frame)
     w_frac, h_frac = _MOUTH_SHAPES.get(viseme, _MOUTH_SHAPES["X"])
     w, h = box.width * w_frac, box.height * h_frac
