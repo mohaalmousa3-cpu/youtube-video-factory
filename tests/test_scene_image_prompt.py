@@ -269,3 +269,82 @@ def test_module_defines_no_function_besides_build_scene_image_prompt():
     function_names = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
 
     assert function_names == ["build_scene_image_prompt"]
+
+
+# ---------------------------------------------------------------------
+# visual-identity-v2 content guards (2026-09-17) — phrase-level, not
+# bare-word: SAFETY_SUFFIX legitimately contains "extra limbs" (an
+# anatomical-defect exclusion), so bare "mouth"/"limb" are never banned,
+# only rigging-specific phrases from the removed programmatic
+# mouth/limb-animation feature (see CLAUDE.md's roadmap decision).
+# ---------------------------------------------------------------------
+
+_BANNED_RIGGING_PHRASES = (
+    "viseme",
+    "lip-sync",
+    "lip sync",
+    "lipsync",
+    "rhubarb",
+    "mouthbox",
+    "limbbox",
+    "mouth_box",
+    "limb_box",
+    "mouth_cues",
+    "mouth cues",
+    "mouth animation",
+    "limb sway",
+    "limb_sway",
+    "mouth sway",
+    "mouth rig",
+    "limb rig",
+    "rig the mouth",
+    "rig the limb",
+)
+
+_SCENE_DIRECTION_WORDS = ("camera", "pan", "zoom", "shot", "frame")
+
+_SAFETY_SUFFIX_REQUIRED_TERMS = (
+    "readable text",
+    "captions",
+    "speech bubbles",
+    "logos",
+    "watermarks",
+    "photorealism",
+    "3d rendering",
+    "anime",
+    "extra fingers",
+    "extra limbs",
+    "distorted faces",
+    "duplicated characters",
+    "cluttered backgrounds",
+)
+
+
+@pytest.mark.parametrize("phrase", _BANNED_RIGGING_PHRASES)
+def test_character_anchor_contains_no_banned_rigging_phrase(phrase):
+    assert phrase not in CHARACTER_ANCHOR.lower()
+
+
+@pytest.mark.parametrize("phrase", _BANNED_RIGGING_PHRASES)
+def test_color_anchor_contains_no_banned_rigging_phrase(phrase):
+    assert phrase not in COLOR_ANCHOR.lower()
+
+
+@pytest.mark.parametrize("phrase", _BANNED_RIGGING_PHRASES)
+def test_safety_suffix_contains_no_banned_rigging_phrase(phrase):
+    assert phrase not in SAFETY_SUFFIX.lower()
+
+
+@pytest.mark.parametrize("word", _SCENE_DIRECTION_WORDS)
+def test_character_anchor_contains_no_scene_direction_word(word):
+    assert word not in CHARACTER_ANCHOR.lower()
+
+
+@pytest.mark.parametrize("word", _SCENE_DIRECTION_WORDS)
+def test_color_anchor_contains_no_scene_direction_word(word):
+    assert word not in COLOR_ANCHOR.lower()
+
+
+@pytest.mark.parametrize("term", _SAFETY_SUFFIX_REQUIRED_TERMS)
+def test_safety_suffix_contains_required_exclusion_term(term):
+    assert term in SAFETY_SUFFIX.lower()

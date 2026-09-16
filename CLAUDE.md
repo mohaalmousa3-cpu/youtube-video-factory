@@ -76,6 +76,24 @@ each is a ready-to-use, tested capability waiting for the next script.
 - **`git init`**: proposed, not done — needs explicit separate approval before
   running.
 
+**Roadmap decision (2026-09-17): Phase 3 (mouth movement) and Phase 4
+(body movement) are removed from the active roadmap.** Local motion is
+Ken Burns only (`in`, `out`, `pan_lr`, `pan_up`, `static`). `manual_flow`
+is an optional, human-operated Google Flow handoff — never required,
+never performed locally, and never approximated by local animation code.
+The mouth/limb modules and CLI commands documented above (Phase 3/4
+history preserved as-is) remain in the repository, fully tested, and
+untouched — they are simply not wired into any `videoN_build.py`. See
+`docs/spec-v4/IMPLEMENTATION-PLAN.md` for the formal record.
+
+**Visual identity v2 (2026-09-17, active policy)**: `CHARACTER_ANCHOR`/
+`COLOR_ANCHOR`/`SAFETY_SUFFIX` in `src/core/scene_image_prompt.py` target a
+cohesive hand-drawn 2D stick-figure story-animation style (large round
+pure-white heads, thin charcoal outlines, warm pastel flat backgrounds) —
+see `docs/spec-v4/prompts/STAGE-PROMPTS.md`'s `stage-scene-image-v2`
+section for the full text. The prior `stage-scene-image-v1` wording is
+preserved there for history.
+
 ## Fresh environment setup
 `models/` and `tools/` are gitignored (large binaries, no git repo yet anyway) and
 won't exist in a fresh checkout/venv. Bring the environment up with:
