@@ -55,9 +55,8 @@ done — do not mark a box checked from intent alone.
       Kokoro audio file, not an estimate.
 - [ ] `upscale_image()` runs in the Ken Burns path for at least one test
       scene and produces a measurably sharper frame.
-- [ ] `apply_mouth_animation()`/`apply_limb_sway()` run against a real
-      illustrated scene background (not just the plain-grey test image) and
-      are visually spot-checked for the feathered-edge risk `CLAUDE.md`
-      already flags as untested on busy backgrounds.
+- [ ] (Mouth/limb rigging acceptance criteria removed 2026-09-17 —
+      deferred from the active roadmap; see IMPLEMENTATION-PLAN.md
+      Phase 1D. The dormant modules stay in the repository untouched.)
 - [ ] A paid-provider call path is demonstrably blocked when no approved
       `paid-proposal` record exists for it (negative test).

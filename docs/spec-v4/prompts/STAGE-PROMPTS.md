@@ -43,6 +43,14 @@ must append, in this order, after the scene-specific visual description:
    somewhat. For a scene that specifically wants tension or gloom, this
    wording should be revisited rather than silently dropped — dropping it
    reintroduces the scene-to-scene palette drift it was added to fix.
+
+   **Update (2026-09-17)**: `stage-scene-image-v2` (§6 below) resolves this
+   differently — rather than revisiting or dropping `COLOR_ANCHOR` per
+   scene, the v2 `COLOR_ANCHOR` text itself instructs shifting mood for a
+   tense/somber scene only through restrained accent colors, composition,
+   pose, and background tone, while always preserving the same flat
+   pastel illustrated style — never photorealistic lighting or strong
+   gradients. See §6 for the exact wording.
 3. **`SAFETY_SUFFIX`** — negates pencil crosshatch shading and black
    backgrounds (both confirmed to leak into outputs from underspecified
    prompts per `CLAUDE.md`'s video1 style-bug note), and reiterates "no
@@ -87,3 +95,96 @@ When a `manual-flow-task` is created, its human-readable instructions
 should state plainly: (a) this step is optional, (b) the video already has
 a complete, publishable local render without it, (c) what specific clip
 would benefit and why. Never phrase it as a blocking requirement.
+
+## 6. Scene image prompt construction v2 (Qwen-Image) — active contract
+
+```
+prompt_id: stage-scene-image-v2
+```
+
+**Roadmap note (2026-09-17)**: this section supersedes §2
+(`stage-scene-image-v1`) as the active prompt contract. §2 is preserved
+above as a historical record of the original wording and is no longer
+what `src/core/scene_image_prompt.py` emits.
+
+Assembly order and mechanics are unchanged from v1 — `build_scene_image_prompt()`'s
+public signature, its `"\n\n"`-joined component order (`base_description`,
+then `CHARACTER_ANCHOR` if enabled, then `COLOR_ANCHOR` if enabled, then
+`SAFETY_SUFFIX` always last), and its double-newline separator behavior
+are all untouched. Only the three constants' literal text changed, to
+target the visual identity below.
+
+Visual identity: a cohesive hand-drawn 2D stick-figure story animation
+style — large round pure-white heads, thin charcoal outlines, small
+simple bodies, expressive eyebrows/face lines and body poses, sparse
+emotionally meaningful props, warm flat pastel backgrounds, minimal
+shading, consistent character proportions/clothing across scenes.
+
+**`CHARACTER_ANCHOR`** (required whenever the character appears in the scene,
+same rule as v1):
+```
+A recurring hand-drawn 2D stick-figure character with a large round pure-white
+head, a thin clean charcoal outline, minimal dot or short-line eyes, simple
+expressive eyebrows and mouth lines, and a small simple body with thin dark
+limbs. Keep the head size, outline weight, limb proportions, clothing palette,
+and any fixed accessory identical across every scene where this character
+appears. Flat 2D illustration only; no realistic anatomy, no 3D rendering, no
+photorealism, no anime, no Pixar-like style.
+```
+
+**`COLOR_ANCHOR`**:
+```
+Warm hand-drawn pastel storybook palette: cream, soft beige, muted peach,
+dusty blue, pale sage, and occasional muted salmon accents. Use flat color
+fills with subtle paper-like texture only; keep shading minimal and avoid
+strong gradients, neon colors, glossy lighting, dramatic cinematic contrast,
+or photorealistic materials. For tense or somber scenes, shift mood only
+through restrained accent colors, composition, pose, and background tone while
+preserving the same flat pastel illustrated style.
+```
+
+**`SAFETY_SUFFIX`** (always appended, never optional — same rule as v1):
+```
+No readable text, captions, speech bubbles, UI panels, logos, watermarks,
+brand marks, photorealism, 3D rendering, anime style, glossy CGI, extra
+fingers, extra limbs, distorted faces, duplicated characters, cluttered
+backgrounds, or unrelated props.
+```
+
+**`visual_brief` / `base_description` contract** — the one scene-specific
+free-text field must express, in prose (no structured sub-fields exist for
+this — see `IMPLEMENTATION-PLAN.md`/model docs for why):
+- a concrete scene action;
+- an emotion plus a legible facial/body pose;
+- camera framing and character placement;
+- sparse, named, meaningful props and a flat background;
+- a composition-safe margin (character/props clear of frame edges, so a
+  Ken Burns pan/zoom never crops them — see `ffmpeg_render.ken_burns_clip`'s
+  zoom range, up to ~1.15x, and pan sweeping the full crop window);
+- no mouth/limb rigging instruction of any kind (that capability is
+  deferred from the active roadmap — see `CLAUDE.md`);
+- no restated character anatomy/palette — that is `CHARACTER_ANCHOR`'s job,
+  not the scene brief's.
+
+**Review checklist before generation** (documented here; code-testable
+items are covered by `tests/test_scene_image_prompt.py`, prose items are
+human/LLM-reviewed since `visual_brief` has no structured sub-fields):
+- [ ] `CHARACTER_ANCHOR`/`COLOR_ANCHOR`/`SAFETY_SUFFIX` contain no
+      mouth/limb rigging phrases (code-tested).
+- [ ] `CHARACTER_ANCHOR`/`COLOR_ANCHOR` contain no camera/motion-direction
+      language — that belongs only in the scene-specific brief
+      (code-tested).
+- [ ] `SAFETY_SUFFIX` contains its required exclusion terms (code-tested).
+- [ ] Scene brief names a concrete action, not a generic label.
+- [ ] Scene brief states an emotion plus a legible pose.
+- [ ] Scene brief states camera framing and character placement explicitly.
+- [ ] Scene brief names sparse, specific props and a flat background.
+- [ ] Scene brief keeps the character/props inside a safe composition
+      margin for Ken Burns pan/zoom.
+- [ ] Scene brief contains no mouth/limb rigging instruction.
+- [ ] Scene brief does not restate the character's fixed anatomy/palette.
+
+Every generated image for a scene containing text-adjacent objects
+(screens, gauges, dials, signage) must still be visually spot-checked
+before use — this rule is unchanged from v1 (§2 above,
+`TECHNICAL-SPEC-EN.md` §4, `CLAUDE.md` known-bugs list).

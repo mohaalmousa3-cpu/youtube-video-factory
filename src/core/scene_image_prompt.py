@@ -16,42 +16,42 @@ later scene-image-generation slice will import and call. No file I/O, no
 settings/environment access, no provider/network/subprocess/database call,
 and no mutation of any kind anywhere in this module — build_scene_image_prompt()
 is pure string assembly over its own arguments and the three module-level
-constants below."""
+constants below.
+
+Constants updated 2026-09-17 to the `stage-scene-image-v2` contract (see
+docs/spec-v4/prompts/STAGE-PROMPTS.md section 6) — a cohesive hand-drawn 2D
+stick-figure story-animation style. build_scene_image_prompt()'s public
+signature, component order, and double-newline separator are unchanged;
+only these three constants' literal text changed. The prior
+`stage-scene-image-v1` wording is preserved in that same doc as a
+historical record."""
 from __future__ import annotations
 
-COLOR_ANCHOR = (
-    "Consistent warm color grading across the whole scene: soft golden-amber "
-    "lighting, gentle warm shadows, calm and emotionally intimate mood, "
-    "cohesive muted color palette — avoid harsh contrast or clashing "
-    "saturated colors."
+CHARACTER_ANCHOR = (
+    "A recurring hand-drawn 2D stick-figure character with a large round pure-white "
+    "head, a thin clean charcoal outline, minimal dot or short-line eyes, simple "
+    "expressive eyebrows and mouth lines, and a small simple body with thin dark "
+    "limbs. Keep the head size, outline weight, limb proportions, clothing palette, "
+    "and any fixed accessory identical across every scene where this character "
+    "appears. Flat 2D illustration only; no realistic anatomy, no 3D rendering, no "
+    "photorealism, no anime, no Pixar-like style."
 )
 
-CHARACTER_ANCHOR = (
-    "A recurring adult male stick-figure protagonist with a consistent, "
-    "recognizable character design across every scene: a round, pale "
-    "gray-blue subtly shaded head with a thick black cartoon outline; "
-    "oversized round white eyes with black pupils; thick curved dark "
-    "eyebrows; a compact dark-charcoal subtly tapered torso; equal-length "
-    "thin dark-charcoal line arms and legs; dark-charcoal rounded mitten-like "
-    "hands and flat rounded shoe-like feet. Render the character in thick "
-    "black cartoon outlines as a clean 2D cartoon illustration — never 3D "
-    "and never photorealistic. Keep the same head-to-body ratio, limb "
-    "thickness, height, face placement, color palette, and overall character "
-    "design in every scene. The character must remain clearly male and "
-    "visually identical from scene to scene.\n\n"
-    "Clothing, accessories, held objects, pose, and expression may change "
-    "when required by the story, but must preserve the character's core "
-    "silhouette, proportions, face design, and dark-charcoal body palette."
+COLOR_ANCHOR = (
+    "Warm hand-drawn pastel storybook palette: cream, soft beige, muted peach, "
+    "dusty blue, pale sage, and occasional muted salmon accents. Use flat color "
+    "fills with subtle paper-like texture only; keep shading minimal and avoid "
+    "strong gradients, neon colors, glossy lighting, dramatic cinematic contrast, "
+    "or photorealistic materials. For tense or somber scenes, shift mood only "
+    "through restrained accent colors, composition, pose, and background tone while "
+    "preserving the same flat pastel illustrated style."
 )
 
 SAFETY_SUFFIX = (
-    "The entire scene, including the background, must be a cohesive clean 2D "
-    "cartoon illustration; do not mix a cartoon character with a "
-    "photorealistic environment, photographic lighting, or photographic "
-    "depth of field. No text, captions, speech bubbles, watermarks, logos, "
-    "UI elements, duplicate characters, extra arms, extra legs, malformed "
-    "limbs, photorealistic humans, realistic facial details, 3D rendering, "
-    "or live-action photography."
+    "No readable text, captions, speech bubbles, UI panels, logos, watermarks, "
+    "brand marks, photorealism, 3D rendering, anime style, glossy CGI, extra "
+    "fingers, extra limbs, distorted faces, duplicated characters, cluttered "
+    "backgrounds, or unrelated props."
 )
 
 
