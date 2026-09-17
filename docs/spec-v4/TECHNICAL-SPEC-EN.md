@@ -105,12 +105,18 @@ which are never read by the render pipeline and never reach a viewer.
 - `motion.manual_flow_required: false` — Google Flow (manual, human-operated
   motion polish) is **optional**, never required for a video to ship.
 - `motion.require_local_fallback_for_manual_flow: true` — every video must
-  be fully producible end-to-end using only the local/free pipeline
-  (Ken Burns pan/zoom via `ffmpeg_render.ken_burns_clip`, plus the tested
-  `apply_mouth_animation()` / `apply_limb_sway()` from `character_rig.py`
-  once wired). Manual Flow, when a human chooses to use it, is additive
-  polish on top of a video that is already complete without it — never a
-  blocking dependency.
+  be fully producible end-to-end using only the local/free pipeline: Ken
+  Burns pan/zoom via `ffmpeg_render.ken_burns_clip` (`in`, `out`,
+  `pan_lr`, `pan_up`, `static`). Programmatic mouth/limb rigging via
+  `character_rig.py`'s `apply_mouth_animation()` and `apply_limb_sway()`
+  remains in the repository, fully tested, but is deferred from the
+  active roadmap and is not scheduled to be wired into any build — it is
+  deliberately not part of this local fallback (see
+  `IMPLEMENTATION-PLAN.md`). Manual Flow is an optional, human-operated
+  handoff to Google Flow — never required, never performed locally, and
+  never approximated by local animation code; when a human chooses to use
+  it, it is additive polish on top of a video that is already complete
+  without it.
 - A `manual-flow-task` record (see schema) is how an optional Flow step is
   requested and tracked; it must never carry a hard deadline that blocks
   publication, and the pipeline must produce a valid final video whether or
@@ -126,10 +132,10 @@ measured 249s). Concretely:
 
 1. Synthesize narration audio for a scene first.
 2. Measure its real duration.
-3. Derive Ken Burns / limb-sway / mouth-cue timing from that measured
-   duration (padding with `pad_audio_to_duration()` when the planned screen
-   time exceeds what the narration alone would take, per existing
-   `ffmpeg_render.py` behavior).
+3. Derive Ken Burns timing from that measured duration (padding with
+   `pad_audio_to_duration()` when the planned screen time exceeds what
+   the narration alone would take, per existing `ffmpeg_render.py`
+   behavior).
 
 Any manifest or scene record carrying a duration field must trace that
 value to a measured audio file, not a table lookup or a wpm estimate.
@@ -178,10 +184,16 @@ This spec adds a layer; it does not rewrite `src/providers/` or
   `src/database/db.py`) keep recording one job per provider call; a
   manifest-driven orchestrator is expected to call `job()` per step exactly
   as a hand-written `videoN_build.py` would.
-- `character_rig.py`'s `apply_mouth_animation()` / `apply_limb_sway()` and
-  `image_upscale.py`'s `upscale_image()` are validated-but-unwired
-  capabilities (per `CLAUDE.md`); wiring them into an actual build is
-  Phase 1B+ work, not part of this document changing anything today.
+- `image_upscale.py`'s `upscale_image()` is wired into the generation-only
+  upscale-assisted Ken Burns path (`src/core/ken_burns_upscale_pipeline.py`,
+  the `build-upscaled-ken-burns` CLI command, committed as `bf94d23`).
+  Registering the resulting clip as an artifact remains a separate,
+  explicit, later step (`register-animation-artifact`), not part of that
+  generation call. Programmatic mouth/limb rigging via `character_rig.py`'s
+  `apply_mouth_animation()` and `apply_limb_sway()` remains in the
+  repository, fully tested, but is deferred from the active roadmap and
+  is not scheduled to be wired into any build (see
+  `IMPLEMENTATION-PLAN.md` Phase 1D).
 
 ## 11. Non-goals for this document
 

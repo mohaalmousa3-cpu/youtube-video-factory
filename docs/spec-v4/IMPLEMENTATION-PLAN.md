@@ -44,10 +44,12 @@ gap analysis is written, and `git status`/`git diff --stat` show only
 
 - Wire `image_upscale.upscale_image()` into the Ken Burns path (per
   `CLAUDE.md`: "not wired into any `videoN_build.py` yet").
-- Wire `character_rig.apply_mouth_animation()` / `apply_limb_sway()` into a
-  real build for a scene with hand-measured `MouthBox`/`LimbBox`
-  coordinates, per the constraints already documented in `CLAUDE.md`
-  (scene-specific, hand-measured, not auto-detected).
+- **Deferred from the active roadmap** (decision recorded 2026-09-17):
+  programmatic mouth/limb rigging via `character_rig.py`'s
+  `apply_mouth_animation()` and `apply_limb_sway()` remains in the
+  repository, fully tested, but is deferred from the active roadmap and
+  is not scheduled to be wired into any build. Local motion stays Ken
+  Burns only (`in`, `out`, `pan_lr`, `pan_up`, `static`).
 - Apply `COLOR_ANCHOR` + `CHARACTER_ANCHOR` to every scene prompt per the
   character-identity-lock policy (§9 of `TECHNICAL-SPEC-EN.md`).
 
@@ -57,7 +59,11 @@ gap analysis is written, and `git status`/`git diff --stat` show only
   a corresponding `paid-proposal` record exists with `status: "approved"`.
 - Add a `paid-proposal` review workflow (even a manual one — e.g. a
   human reads and edits the JSON file's `status` field) before Phase 1E is
-  considered done; no automatic approval path.
+  considered done; no automatic approval path. **Done**: see
+  `data/paid_proposals.json.example` — a human copies it to
+  `data/paid_proposals.json` (gitignored, never created automatically) and
+  edits `status` to `"approved"` there; `src/core/cost_guard.py` enforces
+  that no automatic approval path exists.
 
 ## Explicit non-goals for all of the above
 

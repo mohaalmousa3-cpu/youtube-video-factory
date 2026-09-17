@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 .venv/
-data/
+data/*
+!data/paid_proposals.json.example
 *.db
 media/
 output/
