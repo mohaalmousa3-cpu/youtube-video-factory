@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -208,14 +209,17 @@ class RenderSourceValidationError(Exception):
 
 class RenderSourceMismatchError(Exception):
     """Raised by register_render_artifact() when a supplied `prevalidated`
-    result no longer matches the actual file at `source_file` — e.g. the
-    file was replaced or modified after prevalidate_render_source() ran.
+    result does not identify the same file as `source_file`, or no longer
+    matches its current content — e.g. `prevalidated` was computed for a
+    different file entirely (even one with byte-identical content), or the
+    same file was replaced/modified after prevalidate_render_source() ran.
     register_render_artifact() never trusts a caller-supplied prevalidated
-    result without re-confirming its size and checksum via a fresh, local,
-    non-subprocess file read first; this is the "caller/input
-    inconsistency it will not silently work around" case, the same class
-    of failure RenderArtifactRegistrationError documents for the
-    project/manifest identity check above."""
+    result without first confirming `prevalidated.source_path` and
+    `source_file` resolve to the same real path, THEN re-confirming size
+    and checksum via a fresh, local, non-subprocess file read — this is
+    the "caller/input inconsistency it will not silently work around"
+    case, the same class of failure RenderArtifactRegistrationError
+    documents for the project/manifest identity check above."""
 
 
 @dataclass(frozen=True)
@@ -266,12 +270,42 @@ def prevalidate_render_source(source_file: Path) -> PrevalidatedRenderSource:
     )
 
 
-def _cleanup_fresh_copy(destination: Path, created_fresh_copy: bool) -> None:
+class RenderArtifactCleanupError(Exception):
+    """Raised by register_render_artifact() only when `strict_cleanup=True`
+    (used exclusively by src.core.final_video_assembly's FINAL VIDEO
+    ASSEMBLY call path) AND this call's own freshly-copied canonical
+    render/final.mp4 copy could not be removed after a registration
+    failure. Every other caller (the default `strict_cleanup=False`) keeps
+    _cleanup_fresh_copy()'s original best-effort, silently-swallowed
+    behavior unchanged. The canonical orphan path is named in this
+    error's own message (sanitized — never raw OS error text beyond
+    __cause__); the original registration failure that triggered cleanup
+    is preserved via an attached add_note() (naming its type and
+    message), and the cleanup OSError itself is preserved as __cause__ —
+    so a caller (or FINAL VIDEO ASSEMBLY, via its own
+    FinalArtifactCleanupError wrapper) never has to choose which of the
+    two failures to report; a plain rejected RenderArtifactRegistrationResult
+    is never returned when cleanup actually failed."""
+
+
+def _cleanup_fresh_copy(destination: Path, created_fresh_copy: bool, *, strict: bool = False) -> None:
     """Delete `destination` only if THIS call is the one that just created
     it fresh — never a pre-existing file the call found already in place.
-    Best-effort: swallows any failure while deleting so cleanup itself can
-    never mask whatever original exception/rejection triggered it."""
+
+    Default (`strict=False`, every existing caller): best-effort, swallows
+    any failure while deleting so cleanup itself can never mask whatever
+    original exception/rejection triggered it — unchanged from this
+    function's original behavior.
+
+    `strict=True` (used only via register_render_artifact(...,
+    strict_cleanup=True)): a deletion failure is never swallowed — it
+    propagates as an OSError for the caller to fold into a typed
+    RenderArtifactCleanupError, so an orphaned, unregistered canonical
+    file left behind by a failed registration can never go undisclosed."""
     if not created_fresh_copy:
+        return
+    if strict:
+        destination.unlink(missing_ok=True)
         return
     try:
         destination.unlink(missing_ok=True)
@@ -288,6 +322,7 @@ def register_render_artifact(
     now: datetime | None = None,
     prevalidated: PrevalidatedRenderSource | None = None,
     metadata_overrides: Mapping[str, str | int | float | bool | None] | None = None,
+    strict_cleanup: bool = False,
 ) -> RenderArtifactRegistrationResult:
     """Register `source_file` as this project's canonical, project-level
     "render" artifact. Writes nothing to SQLite or the filesystem on any
@@ -303,14 +338,26 @@ def register_render_artifact(
     for a caller (see src.core.final_video_assembly) that already ran
     prevalidate_render_source() on `source_file` before opening this
     call's SQLite connection, so no ffprobe/ffmpeg subprocess call ever
-    happens while that connection is open. The size and checksum this
-    function already computes for `source_file` are compared against
-    `prevalidated.byte_size`/`.sha256_checksum` first (a pure, local,
-    non-subprocess file read — never a raw boolean trusted blindly); a
-    mismatch raises RenderSourceMismatchError rather than silently
-    re-validating or falling back. Every existing caller that omits this
-    parameter (the default, `None`) gets exactly the same behavior as
-    before this parameter existed — full ffprobe validation, every time.
+    happens while that connection is open. Before any of
+    `prevalidated`'s fields are trusted, this function first resolves
+    both `prevalidated.source_path` and `source_file` (`Path.resolve()`,
+    the same symlink-following/normalization convention this module and
+    prevalidate_render_source() already use elsewhere) and compares them
+    case-insensitively (`os.path.normcase`, matching this codebase's
+    established Windows-safe path-comparison convention — see
+    src.core.final_video_assembly's own `_load_assembly_plan()`); a
+    prevalidation result computed for a different file — even one whose
+    bytes currently happen to match — is rejected via
+    RenderSourceMismatchError before its `duration_seconds` (or any other
+    field) is ever read. Only once path identity is confirmed are the
+    size and checksum this function already computes for `source_file`
+    compared against `prevalidated.byte_size`/`.sha256_checksum` (a pure,
+    local, non-subprocess file read — never a raw boolean trusted
+    blindly); a mismatch there raises RenderSourceMismatchError too,
+    rather than silently re-validating or falling back. Every existing
+    caller that omits this parameter (the default, `None`) gets exactly
+    the same behavior as before this parameter existed — full ffprobe
+    validation, every time.
 
     `metadata_overrides` (optional, keyword-only): merged into (and
     taking precedence over) the default `{"duration_seconds": ...,
@@ -318,7 +365,17 @@ def register_render_artifact(
     for a caller that wants additional scalar-only metadata fields (e.g.
     scene_count, a manifest identifier) without this function adding a
     new database column or changing its own default metadata shape for
-    every other caller that omits this parameter."""
+    every other caller that omits this parameter.
+
+    `strict_cleanup` (optional, keyword-only, default False): when a
+    freshly-copied canonical file this call itself just created needs to
+    be removed after a registration failure, the default (`False`)
+    behavior is unchanged — best-effort, silently swallowed, exactly as
+    before this parameter existed. `strict_cleanup=True` (used only by
+    src.core.final_video_assembly) instead raises RenderArtifactCleanupError
+    if that removal fails, naming the orphaned canonical path, so a failed
+    run can never silently leave an unregistered canonical render/final.mp4
+    behind — see RenderArtifactCleanupError's own docstring."""
     when = now if now is not None else datetime.now(timezone.utc)
     if manifest.project_id != project.project_id:
         raise RenderArtifactRegistrationError(
@@ -418,6 +475,21 @@ def register_render_artifact(
         final_checksum, final_size = None, None  # computed after the copy below
 
     if prevalidated is not None:
+        # Path identity FIRST, before any of prevalidated's other fields
+        # are trusted — a prevalidation result computed for a different
+        # file must never be accepted merely because its recorded bytes
+        # currently happen to match. Pure, local, non-subprocess: both
+        # sides resolved (symlink-following, matching this module's own
+        # resolve() convention) and compared case-insensitively (Windows
+        # path-case safety).
+        resolved_source = source_file.resolve()
+        if os.path.normcase(str(resolved_source)) != os.path.normcase(str(prevalidated.source_path)):
+            raise RenderSourceMismatchError(
+                f"prevalidated result was computed for {prevalidated.source_path}, which does not "
+                f"resolve to the same file as the source_file supplied for registration "
+                f"({source_file}) — refusing to trust a prevalidation result computed for a "
+                "different path even if its recorded bytes currently match"
+            )
         # Pure, local, non-subprocess reconfirmation — never trust a
         # caller-supplied prevalidated result outright. source_checksum/
         # source_size above were already computed unconditionally, so
@@ -470,15 +542,36 @@ def register_render_artifact(
         sqlite3.Error,
     ) as exc:
         # A documented, expected failure mode of register_artifact() — an
-        # ordinary rejection, reported via the result, never raised.
-        _cleanup_fresh_copy(destination, created_fresh_copy)
+        # ordinary rejection, reported via the result, never raised...
+        # UNLESS strict_cleanup=True and this call's own freshly-copied
+        # canonical file could not then be removed, in which case that
+        # combination must never be reported as a normal clean rejection.
+        try:
+            _cleanup_fresh_copy(destination, created_fresh_copy, strict=strict_cleanup)
+        except OSError as cleanup_exc:
+            cleanup_error = RenderArtifactCleanupError(
+                f"registration was rejected ({exc}) and the freshly-copied canonical file at "
+                f"{destination} could not be removed"
+            )
+            cleanup_error.add_note(f"original registration rejection: {type(exc).__name__}: {exc}")
+            raise cleanup_error from cleanup_exc
         return _result(ok=False, duration_seconds=duration_seconds, reasons=(str(exc),))
-    except Exception:
+    except Exception as exc:
         # Anything else is undocumented/unexpected: still clean up a
         # freshly-copied file (never a pre-existing one), but this is a
         # bug to surface, not an ordinary outcome — re-raise unchanged
-        # rather than silently downgrading it into a rejected result.
-        _cleanup_fresh_copy(destination, created_fresh_copy)
+        # rather than silently downgrading it into a rejected result...
+        # unless strict cleanup itself then fails, in which case THAT
+        # failure must not be lost either.
+        try:
+            _cleanup_fresh_copy(destination, created_fresh_copy, strict=strict_cleanup)
+        except OSError as cleanup_exc:
+            cleanup_error = RenderArtifactCleanupError(
+                f"registration failed unexpectedly ({type(exc).__name__}) and the freshly-copied "
+                f"canonical file at {destination} could not be removed"
+            )
+            cleanup_error.add_note(f"original unexpected registration failure: {type(exc).__name__}: {exc}")
+            raise cleanup_error from cleanup_exc
         raise
 
     return _result(

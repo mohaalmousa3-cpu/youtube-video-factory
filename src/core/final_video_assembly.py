@@ -96,6 +96,7 @@ from src.core.manifest_store import ManifestStoreError, load_manifest
 from src.core.path_safety import resolve_under_project_dir
 from src.core.render_artifact_registrar import (
     PrevalidatedRenderSource,
+    RenderArtifactCleanupError,
     RenderSourceMismatchError,
     RenderSourceValidationError,
     prevalidate_render_source,
@@ -215,6 +216,21 @@ class FinalArtifactRegistrationError(FinalVideoAssemblyError):
     module removes the just-placed --output file in that case."""
 
 
+class FinalArtifactCleanupError(FinalVideoAssemblyError):
+    """Registering the successful --output file failed AND
+    register_render_artifact()'s own strict cleanup of its
+    freshly-copied canonical render/final.mp4 copy also failed (this
+    module always passes strict_cleanup=True — see the registration call
+    site below) — a second, independent orphan on top of the
+    registration failure itself, wrapped from the registrar's own
+    RenderArtifactCleanupError with its cause preserved. This module's
+    own outer cleanup still attempts to remove --output regardless of
+    which registration-path exception is in flight; if that removal also
+    fails, both orphan paths remain discoverable via exception
+    chaining/notes rather than either one going undisclosed — see
+    assemble_final_video()'s own docstring."""
+
+
 @dataclass(frozen=True)
 class FinalVideoAssemblyResult:
     """The one typed result assemble_final_video() returns on success."""
@@ -270,7 +286,17 @@ def _probe_stream_types(media_path: Path) -> frozenset[str]:
     assumption — an animation artifact's audio-stream presence is a
     yes/no safety gate that decides whether narration gets muxed in or
     skipped, so an unknown probe result must never be silently read as
-    "no audio"; it must fail the whole call instead."""
+    "no audio"; it must fail the whole call instead.
+
+    The parse itself is equally strict about STRUCTURE, not just
+    transport/JSON-syntax failures: a missing/non-list "streams" key, an
+    EMPTY streams list, a non-dict stream entry, a stream entry with no
+    "codec_type" key, or a codec_type that is not a non-empty string ALL
+    raise MediaProbeError — none of these are silently treated as "this
+    stream/file has no such stream type" by returning an empty or partial
+    frozenset. Every stream entry must be fully well-formed for this
+    function to return normally at all; one malformed entry among
+    otherwise-valid ones still raises, never returns a partial result."""
     ffmpeg_path = Path(get_settings().ffmpeg_path)
     ffprobe_name = "ffprobe.exe" if ffmpeg_path.suffix == ".exe" else "ffprobe"
     ffprobe = str(ffmpeg_path.with_name(ffprobe_name))
@@ -294,18 +320,31 @@ def _probe_stream_types(media_path: Path) -> frozenset[str]:
     except json.JSONDecodeError as exc:
         raise MediaProbeError(f"ffprobe produced malformed JSON while inspecting {media_path.name!r}") from exc
 
-    if not isinstance(payload, dict) or not isinstance(payload.get("streams"), list):
+    if not isinstance(payload, dict):
         raise MediaProbeError(f"ffprobe produced an unexpected JSON structure while inspecting {media_path.name!r}")
 
+    streams = payload.get("streams")
+    if not isinstance(streams, list) or not streams:
+        raise MediaProbeError(
+            f"ffprobe produced no usable stream information while inspecting {media_path.name!r}"
+        )
+
     stream_types: set[str] = set()
-    for stream in payload["streams"]:
+    for stream in streams:
         if not isinstance(stream, dict):
             raise MediaProbeError(
                 f"ffprobe produced an unexpected stream entry while inspecting {media_path.name!r}"
             )
-        codec_type = stream.get("codec_type")
-        if isinstance(codec_type, str):
-            stream_types.add(codec_type)
+        if "codec_type" not in stream:
+            raise MediaProbeError(
+                f"ffprobe produced a stream entry with no codec_type while inspecting {media_path.name!r}"
+            )
+        codec_type = stream["codec_type"]
+        if not isinstance(codec_type, str) or not codec_type:
+            raise MediaProbeError(
+                f"ffprobe produced a stream entry with an invalid codec_type while inspecting {media_path.name!r}"
+            )
+        stream_types.add(codec_type)
     return frozenset(stream_types)
 
 
@@ -648,10 +687,15 @@ def assemble_final_video(project_id: str, manifest_path: Path, output_path: Path
                         now=datetime.now(timezone.utc),
                         prevalidated=prevalidated,
                         metadata_overrides=metadata_overrides,
+                        strict_cleanup=True,
                     )
                 except RenderSourceMismatchError as exc:
                     raise FinalArtifactRegistrationError(
                         "final output changed unexpectedly between pre-validation and registration"
+                    ) from exc
+                except RenderArtifactCleanupError as exc:
+                    raise FinalArtifactCleanupError(
+                        "final artifact registration failed and its own canonical-copy cleanup also failed"
                     ) from exc
                 except Exception as exc:
                     raise FinalArtifactRegistrationError("final artifact registration failed") from exc

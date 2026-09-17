@@ -21,6 +21,7 @@ from src.core.final_video_assembly import (
     ArtifactFileNotFoundError,
     EmptyManifestError,
     ExistingFinalVideoArtifactError,
+    FinalArtifactCleanupError,
     FinalArtifactRegistrationError,
     FinalConcatError,
     FinalVideoAssemblyResult,
@@ -38,6 +39,7 @@ from src.core.final_video_assembly import (
     _resolve_scene_sources,
     assemble_final_video,
 )
+from src.core.render_artifact_registrar import RenderArtifactCleanupError
 from src.core.manifest_builder import build_video_manifest
 from src.core.manifest_store import save_manifest
 from src.core.project_state_machine import create_initial_project, initial_transition_for
@@ -1341,11 +1343,188 @@ def test_no_cleanup_exception_silently_suppressed():
 
 
 # ---------------------------------------------------------------------
+# _probe_stream_types() direct parser tests (STEP 3 of the second
+# corrective pass) — called directly, not via assemble_final_video(),
+# with subprocess.run mocked so the REAL parsing/validation logic runs.
+# ---------------------------------------------------------------------
+
+
+def _fake_ffprobe_stdout(monkeypatch, stdout: str, returncode: int = 0) -> None:
+    import subprocess as sp
+
+    fake_result = sp.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+    monkeypatch.setattr(f"{MODULE}.subprocess.run", lambda *a, **k: fake_result)
+
+
+def test_probe_parser_empty_streams_list_raises(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": []}')
+
+    with pytest.raises(MediaProbeError):
+        _probe_stream_types(tmp_path / "x.mp4")
+
+
+def test_probe_parser_empty_stream_object_raises(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": [{}]}')
+
+    with pytest.raises(MediaProbeError):
+        _probe_stream_types(tmp_path / "x.mp4")
+
+
+def test_probe_parser_missing_codec_type_raises(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": [{"index": 0}]}')
+
+    with pytest.raises(MediaProbeError):
+        _probe_stream_types(tmp_path / "x.mp4")
+
+
+def test_probe_parser_codec_type_none_raises(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": [{"codec_type": null}]}')
+
+    with pytest.raises(MediaProbeError):
+        _probe_stream_types(tmp_path / "x.mp4")
+
+
+def test_probe_parser_codec_type_empty_string_raises(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": [{"codec_type": ""}]}')
+
+    with pytest.raises(MediaProbeError):
+        _probe_stream_types(tmp_path / "x.mp4")
+
+
+def test_probe_parser_codec_type_non_string_raises(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": [{"codec_type": 7}]}')
+
+    with pytest.raises(MediaProbeError):
+        _probe_stream_types(tmp_path / "x.mp4")
+
+
+def test_probe_parser_mixed_valid_and_malformed_entries_raises(tmp_path, monkeypatch):
+    """One malformed entry among otherwise-valid ones still raises — no
+    partial/best-effort result is ever returned."""
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": [{"codec_type": "video"}, {}]}')
+
+    with pytest.raises(MediaProbeError):
+        _probe_stream_types(tmp_path / "x.mp4")
+
+
+def test_probe_parser_valid_video_only_result(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": [{"codec_type": "video"}]}')
+
+    assert _probe_stream_types(tmp_path / "x.mp4") == frozenset({"video"})
+
+
+def test_probe_parser_valid_video_and_audio_result(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, '{"streams": [{"codec_type": "video"}, {"codec_type": "audio"}]}')
+
+    assert _probe_stream_types(tmp_path / "x.mp4") == frozenset({"video", "audio"})
+
+
+def test_probe_parser_nonzero_exit_remains_fail_closed(tmp_path, monkeypatch):
+    from src.core.final_video_assembly import _probe_stream_types
+
+    _fake_ffprobe_stdout(monkeypatch, "", returncode=1)
+
+    with pytest.raises(MediaProbeError):
+        _probe_stream_types(tmp_path / "x.mp4")
+
+
+# ---------------------------------------------------------------------
+# strict canonical cleanup wrapping (STEP 4 of the second corrective pass)
+# ---------------------------------------------------------------------
+
+
+def test_strict_registrar_cleanup_failure_wrapped_as_final_artifact_cleanup_error(
+    isolated_db, tmp_path, monkeypatch
+):
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    calls: list = []
+    _mock_ffmpeg_ok(monkeypatch, calls)
+
+    def _fail_register(*a, **k):
+        cause = OSError("simulated: permission denied")
+        err = RenderArtifactCleanupError(
+            "registration was rejected and the freshly-copied canonical file could not be removed"
+        )
+        raise err from cause
+
+    monkeypatch.setattr(f"{MODULE}.register_render_artifact", _fail_register)
+    output = tmp_path / "out.mp4"
+
+    with pytest.raises(FinalArtifactCleanupError) as exc_info:
+        assemble_final_video(project_id, project_dir / "manifest.json", output)
+
+    assert isinstance(exc_info.value.__cause__, RenderArtifactCleanupError)
+    # The module's own outer cleanup still removes the newly-created --output.
+    assert not output.exists()
+
+
+def test_strict_registrar_cleanup_failure_and_output_removal_both_fail_report_both_orphans(
+    isolated_db, tmp_path, monkeypatch
+):
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    calls: list = []
+    _mock_ffmpeg_ok(monkeypatch, calls)
+
+    canonical_orphan = project_dir / "render" / "final.mp4"
+
+    def _fail_register(*a, **k):
+        cause = OSError("simulated: permission denied")
+        err = RenderArtifactCleanupError(
+            f"registration was rejected and the freshly-copied canonical file at {canonical_orphan} "
+            "could not be removed"
+        )
+        raise err from cause
+
+    monkeypatch.setattr(f"{MODULE}.register_render_artifact", _fail_register)
+
+    real_unlink = Path.unlink
+
+    def _fail_unlink(self, *a, **k):
+        if self.name == "out.mp4":
+            raise OSError("simulated: permission denied")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", _fail_unlink)
+    output = tmp_path / "out.mp4"
+
+    with pytest.raises(FinalArtifactCleanupError) as exc_info:
+        assemble_final_video(project_id, project_dir / "manifest.json", output)
+
+    # Orphan #1 (the canonical render/final.mp4 copy) is named inside the
+    # wrapped RenderArtifactCleanupError.
+    assert str(canonical_orphan) in str(exc_info.value.__cause__)
+    # Orphan #2 (--output itself) is named via the outer cleanup's note.
+    notes = getattr(exc_info.value, "__notes__", [])
+    assert any("orphaned output" in note for note in notes)
+
+
+# ---------------------------------------------------------------------
 # optional real-ffmpeg integration test — doubly-gated
 # ---------------------------------------------------------------------
 
 
-def test_real_pipeline_integration(isolated_db, tmp_path):
+def test_real_pipeline_integration(isolated_db, tmp_path, monkeypatch):
+    import socket
     import subprocess
 
     from src.database.artifact_repository import list_artifacts_by_project
@@ -1382,6 +1561,18 @@ def test_real_pipeline_integration(isolated_db, tmp_path):
         _register_audio(project_dir, project_id, scene_id, content=audio_path.read_bytes())
 
     output = tmp_path / "final.mp4"
+
+    # Narrow network guard for the assembly call itself: local ffmpeg/
+    # ffprobe subprocess calls go through CreateProcess (Windows) /
+    # posix_spawn, never Python's socket module, so this cannot affect
+    # real FFmpeg behavior — it only proves no code path in this call
+    # attempts to open a network socket (which any provider/network HTTP
+    # client, directly or via urllib/requests, would need to do).
+    def _no_network(*a, **k):
+        raise AssertionError("no network socket access expected during final video assembly")
+
+    monkeypatch.setattr(socket, "socket", _no_network)
+
     result = assemble_final_video(project_id, project_dir / "manifest.json", output)
 
     assert output.exists()
@@ -1405,6 +1596,24 @@ def test_real_pipeline_integration(isolated_db, tmp_path):
     assert len(renders) == 1
     assert renders[0].metadata["scene_count"] == 2
     assert renders[0].metadata["manifest_fingerprint"] == manifest.source_fingerprint
+    assert renders[0].metadata["source"] == "final-video-assembly-v1"
+    assert renders[0].metadata["duration_seconds"] == pytest.approx(result.measured_duration_seconds)
 
+    # The registrar's own canonical copy: exists, is a real audiovisual
+    # file in its own right (probed independently of --output), and is a
+    # byte-for-byte copy of --output under the registrar's established
+    # copy policy (see register_render_artifact()'s docstring — it hashes
+    # the COPY, not the source, but never rewrites/transcodes it).
+    canonical_path = project_dir / "render" / "final.mp4"
+    assert canonical_path.exists()
+    canonical_streams = _probe_stream_types(canonical_path)
+    assert "video" in canonical_streams
+    assert "audio" in canonical_streams
+    assert hashlib.sha256(output.read_bytes()).hexdigest() == hashlib.sha256(canonical_path.read_bytes()).hexdigest()
+    assert renders[0].sha256_checksum == hashlib.sha256(canonical_path.read_bytes()).hexdigest()
+
+    # No unexpected canonical or temporary artifact remains: exactly one
+    # file in render/, and no leftover assembly tempdir.
+    assert [p.name for p in canonical_path.parent.iterdir()] == ["final.mp4"]
     leftover = [p for p in tmp_path.iterdir() if p.name.startswith("final-video-assembly-")]
     assert leftover == []
