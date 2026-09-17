@@ -1926,6 +1926,82 @@ def cmd_advance_project_stage(args: argparse.Namespace) -> int:
     return 0 if result.approved and result.db_committed else 1
 
 
+def cmd_assemble_final_video(args: argparse.Namespace) -> int:
+    """FINAL VIDEO ASSEMBLY V1: local-only, generation-and-registration
+    final assembly for one project. Resolves every scene's already-
+    registered animation+audio artifacts (manifest order), concatenates
+    them into one MP4 at --output, and registers the result as this
+    project's canonical "render" artifact via the existing, unmodified
+    register_render_artifact(). Local FFmpeg/ffprobe only — no provider,
+    no network call anywhere in this command path.
+
+    All SQLite access lives inside src.core.final_video_assembly.assemble_final_video()
+    itself (two short-lived connections, opened and closed internally,
+    never held open across the FFmpeg work in between) — a deliberate
+    departure from every other command's "CLI owns all SQLite access"
+    shape, required by this command's three-part lifecycle; see that
+    module's own docstring for why. This command function therefore opens
+    no connection of its own.
+
+    JSON-mode failures are printed to stderr here, unlike this codebase's
+    other 20+ commands (whose own `_fail()` closures print JSON — success
+    or failure alike — to stdout). That is a deliberate, narrow exception
+    for this one command, not a silent inconsistency: this command's own
+    review explicitly required errors to go to stderr in both output
+    modes. The other commands' existing stdout-for-all-JSON behavior is
+    untouched.
+
+    An undocumented/unexpected exception (not a FinalVideoAssemblyError
+    subclass) is caught at this boundary and reported as one short,
+    generic, sanitized message — never the original exception's own text,
+    traceback, or any environment/provider credential.
+    KeyboardInterrupt/SystemExit are BaseException, not Exception, so
+    neither is ever caught here."""
+    from src.core.final_video_assembly import FinalVideoAssemblyError, assemble_final_video
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"assemble-final-video: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {"ok": False, "project_id": args.project_id, "reason": reason}
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True), file=sys.stderr)
+        else:
+            print(f"assemble-final-video: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        result = assemble_final_video(args.project_id, Path(args.manifest), Path(args.output))
+    except FinalVideoAssemblyError as exc:
+        return _fail(str(exc))
+    except Exception:
+        return _fail("an unexpected internal error occurred")
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": result.project_id,
+            "output": str(result.output_path),
+            "scene_count": result.scene_count,
+            "measured_duration_seconds": result.measured_duration_seconds,
+            "artifact_id": result.artifact_id,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("assemble-final-video: OK (final video assembled and registered)")
+        print(f"  project_id: {result.project_id}")
+        print(f"  output: {result.output_path}")
+        print(f"  scene_count: {result.scene_count}")
+        print(f"  measured_duration_seconds: {result.measured_duration_seconds}")
+        print(f"  artifact_id: {result.artifact_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -2268,6 +2344,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     build_scene_audio.set_defaults(func=cmd_build_scene_audio)
+
+    assemble_final_video = sub.add_parser(
+        "assemble-final-video",
+        help="Local-only: assemble one project's already-registered per-scene animation+audio "
+        "artifacts, in manifest order, into one final MP4 at --output, and register it as this "
+        "project's canonical render artifact; no provider, no network call",
+    )
+    assemble_final_video.add_argument("project_id")
+    assemble_final_video.add_argument(
+        "--manifest", required=True, help="Path to the enriched VideoManifest JSON"
+    )
+    assemble_final_video.add_argument(
+        "--output", required=True, help="Path to save the final assembled MP4; must not already exist"
+    )
+    assemble_final_video.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    assemble_final_video.set_defaults(func=cmd_assemble_final_video)
 
     return parser
 
