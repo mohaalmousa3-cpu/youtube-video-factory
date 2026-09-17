@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS project_transitions (
 CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id     TEXT PRIMARY KEY,
     project_id      TEXT NOT NULL REFERENCES projects (project_id),
-    kind            TEXT NOT NULL CHECK (kind IN ('audio','visual','animation','render','qc_report')),
+    kind            TEXT NOT NULL CHECK (kind IN ('audio','visual','animation','render','qc_report','overlay_render')),
     scene_id        TEXT,
     relative_path   TEXT NOT NULL,
     byte_size       INTEGER NOT NULL,
