@@ -1,0 +1,557 @@
+"""FINAL VIDEO ASSEMBLY V1: local-only, generation-and-registration final
+assembly. See src/cli.py's cmd_assemble_final_video for the CLI command.
+
+Given a project_id and an already-fully-produced manifest (every scene
+already has exactly one registered "audio" and one registered "animation"
+artifact), this module resolves those per-scene artifacts in manifest
+order, mux's each scene's animation clip with its registered audio (only
+when the animation clip has no audio stream of its own — see below),
+concatenates all prepared scene clips into one final MP4, validates it,
+atomically places it at --output, and registers it as this project's
+canonical, project-level "render" artifact via the existing, unmodified
+src.core.render_artifact_registrar.register_render_artifact() — reusing
+that exact artifact type/pattern rather than inventing a new one, since it
+already IS the "one final video per project" contract this phase needs.
+
+This phase does NOT implement story/scene generation, image generation,
+text-overlay derivation/rendering, lip-sync, mouth animation, limb
+animation, general end-to-end orchestration, background music, publishing,
+or Manual Flow automation. Local FFmpeg/ffprobe only — no provider, no
+network call anywhere in this module.
+
+Deliberate convention departure (see the inspection note in this phase's
+approval message): every other src/core/ module is 100% database-free,
+with the CLI doing all SQLite access before/after calling it. That
+convention does not cleanly support this phase's required three-part
+lifecycle (a short DB phase, then a long-running FFmpeg phase with NO
+connection open, then a second short DB phase) around one long-running
+external process, so assemble_final_video() opens and closes its own two
+short-lived connections internally, via the same parameterless
+get_readonly_connection()/get_connection() every CLI command already uses
+— never a connection injected by the caller, and never held open across
+any FFmpeg/ffprobe subprocess call.
+
+No function in src/render/ffmpeg_render.py accepts an ffmpeg_path/
+ffprobe_path parameter anywhere in this codebase — every existing
+generation module resolves the binary via src.utils.config.get_settings()
+internally, with zero exceptions. This module follows that same
+convention rather than threading an override parameter through.
+
+Three-part lifecycle:
+  A. Open a short-lived read-only connection: verify the project, load and
+     validate the manifest, resolve exactly one audio + one animation
+     artifact per scene (manifest order, never sorted), reject missing/
+     ambiguous artifacts, confirm every resolved artifact file exists,
+     confirm --output does not conflict with any source path or an
+     existing file, confirm no "render" artifact is already registered
+     for this project. Capture every immutable value FFmpeg work needs.
+     Close the connection.
+  B. FFmpeg-only work, no database connection open at all: per scene,
+     inspect the animation clip's audio-stream presence (never mux twice),
+     mux where needed, concatenate every prepared clip in manifest order,
+     validate the concatenated result, atomically replace --output only
+     after that validation passes.
+  C. Open a short-lived read-write connection: reconfirm nothing else
+     registered a "render" artifact for this project in the meantime,
+     register the successful --output file via the existing
+     register_render_artifact(), close the connection. A registration
+     failure at this point removes the just-placed --output file (the
+     registrar's own internal project-relative copy already cleans up
+     after itself on failure) — this call's own output is the only file
+     THIS module is responsible for on that path.
+
+Cleanup proof: check "output_path does not already exist" in phase A
+happens before this module creates anything at all, so any file found at
+output_path from that point forward was necessarily written by THIS SAME
+call — removing it on failure can never delete a pre-existing caller
+file. Every temporary scene clip and the temporary final output live under
+one tempfile.mkdtemp() directory created on the same filesystem as
+output_path (for a true atomic os.replace()), removed via shutil.rmtree()
+in a `finally` regardless of outcome. Source artifacts (the registered
+audio/animation files) are opened read-only and never written, moved, or
+deleted anywhere in this module.
+
+Domain errors: every ordinary rejection this module can produce is one of
+the FinalVideoAssemblyError subclasses below — the CLI only ever needs to
+catch that one base type. Message text never includes raw ffmpeg/ffprobe
+subprocess output; wrapped ProviderError/ManifestStoreError/OSError
+instances are always chained via `from exc` (preserved as __cause__), not
+echoed verbatim."""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence
+
+from src.core.manifest_store import ManifestStoreError, load_manifest
+from src.core.path_safety import resolve_under_project_dir
+from src.core.render_artifact_registrar import register_render_artifact
+from src.database.artifact_repository import list_artifacts_by_project
+from src.database.db import get_connection, get_readonly_connection
+from src.database.project_repository import get_project
+from src.models.artifact import ArtifactRecord
+from src.models.manifest import VideoManifest
+from src.providers.base import ProviderError
+from src.render.ffmpeg_render import concat_videos, get_duration_seconds, mux_audio_video
+from src.utils.config import get_settings
+
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+class FinalVideoAssemblyError(Exception):
+    """Base class for every reason assemble_final_video() cannot produce
+    --output. The CLI catches only this one type. Message text is always
+    a short, sanitized string naming project_id/scene_id/artifact_id/
+    counts — never raw subprocess stderr, a manifest's content, or a
+    resolved filesystem path beyond what the message needs to be
+    actionable."""
+
+
+class ProjectNotFoundError(FinalVideoAssemblyError):
+    """No project is registered with the given project_id."""
+
+
+class ManifestNotFoundError(FinalVideoAssemblyError):
+    """--manifest does not exist or is not a regular file."""
+
+
+class InvalidManifestError(FinalVideoAssemblyError):
+    """--manifest could not be parsed/validated as a VideoManifest, or its
+    project_id/source_fingerprint does not match the project registry."""
+
+
+class EmptyManifestError(FinalVideoAssemblyError):
+    """The manifest's scene_plan contains zero scenes."""
+
+
+class InvalidSceneOrderError(FinalVideoAssemblyError):
+    """Defensive only: ScenePlan's own validator already guarantees unique,
+    contiguously-sequenced scenes for any manifest that reaches this
+    module via load_manifest() — this is unreachable through that path,
+    reachable only by calling the internal scene-resolution helper
+    directly with a hand-crafted, invariant-violating scene list, the same
+    kind of direct-unit-test-only defensive check this codebase already
+    uses elsewhere (see src.core.mouth_animation_generation._derive_durations)."""
+
+
+class MissingSceneArtifactError(FinalVideoAssemblyError):
+    """A scene has zero eligible registered audio or animation artifacts."""
+
+
+class AmbiguousSceneArtifactError(FinalVideoAssemblyError):
+    """A scene has more than one eligible registered audio or animation
+    artifact — this module never silently picks one."""
+
+
+class ArtifactFileNotFoundError(FinalVideoAssemblyError):
+    """A resolved artifact's recorded relative_path does not exist on disk
+    as a regular file."""
+
+
+class OutputPathConflictError(FinalVideoAssemblyError):
+    """--output already exists, is a directory, or resolves to one of the
+    scene source artifact paths this call would otherwise read from."""
+
+
+class ExistingFinalVideoArtifactError(FinalVideoAssemblyError):
+    """A "render" artifact is already registered for this project. This
+    module never overwrites or replaces an existing registration — reuses
+    register_render_artifact()'s own established idempotency policy
+    (checksum-match-only) rather than inventing a new one; a rerun that
+    would produce different content is rejected here, before any FFmpeg
+    work, rather than discovered only after."""
+
+
+class SceneMuxError(FinalVideoAssemblyError):
+    """Preparing one scene's clip (audio-stream inspection or muxing)
+    failed."""
+
+
+class FinalConcatError(FinalVideoAssemblyError):
+    """Concatenating the prepared scene clips failed."""
+
+
+class InvalidFinalOutputError(FinalVideoAssemblyError):
+    """The rendered final file is missing, empty, has an unmeasurable/
+    non-finite/non-positive duration, or its duration does not match the
+    sum of prepared scene durations within tolerance."""
+
+
+class FinalArtifactRegistrationError(FinalVideoAssemblyError):
+    """Registering the successful --output file as this project's "render"
+    artifact failed, after --output was already atomically placed. This
+    module removes the just-placed --output file in that case."""
+
+
+@dataclass(frozen=True)
+class FinalVideoAssemblyResult:
+    """The one typed result assemble_final_video() returns on success."""
+
+    project_id: str
+    output_path: Path
+    scene_count: int
+    measured_duration_seconds: float
+    artifact_id: str
+
+
+@dataclass(frozen=True)
+class _SceneSourcePaths:
+    scene_id: str
+    animation_path: Path
+    audio_path: Path
+
+
+def _sanitize_for_filename(scene_id: str) -> str:
+    """scene_id is already constrained to '^scene-[0-9]{2,3}$' by
+    ScenePlanItem's own field pattern, so this is defensive rather than
+    load-bearing — matches this codebase's habit of re-checking an
+    invariant a caller already guarantees rather than trusting it silently."""
+    return _SAFE_FILENAME_RE.sub("_", scene_id)
+
+
+def _duration_tolerance_seconds(scene_count: int) -> float:
+    """Documented, evidence-based tolerance for container/timestamp
+    rounding only — never large enough to hide a missing scene. 0.25s
+    fixed floor (a single dropped/duplicated frame at low fps) plus 0.05s
+    per scene (concat-demuxer boundary rounding accumulates per join, the
+    same accumulation CLAUDE.md's "known bugs already fixed" section
+    documents for mux_audio_video's own tpad fix)."""
+    return max(0.25, 0.05 * scene_count)
+
+
+def _has_audio_stream(media_path: Path) -> bool:
+    """Local, read-only ffprobe query for whether `media_path` already
+    contains an audio stream — same ffprobe-path derivation pattern
+    get_duration_seconds()/animation_artifact_registrar.py's own
+    _has_video_stream() use, duplicated here rather than added to
+    ffmpeg_render.py, matching this codebase's explicit, established
+    convention of small self-contained duplicates for this exact
+    ffprobe-stream-check shape (see animation_artifact_registrar.py's own
+    docstring for that precedent). Returns False on any ffprobe failure —
+    the caller has already proven the file is valid, probeable media via
+    get_duration_seconds() before this is ever called."""
+    ffmpeg_path = Path(get_settings().ffmpeg_path)
+    ffprobe_name = "ffprobe.exe" if ffmpeg_path.suffix == ".exe" else "ffprobe"
+    ffprobe = str(ffmpeg_path.with_name(ffprobe_name))
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(media_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    return any(stream.get("codec_type") == "audio" for stream in streams)
+
+
+def _resolve_scene_sources(
+    manifest: VideoManifest,
+    audio_artifacts: Sequence[ArtifactRecord],
+    animation_artifacts: Sequence[ArtifactRecord],
+    project_dir_resolved: Path,
+) -> list[_SceneSourcePaths]:
+    """Pure, no I/O beyond the artifact-list arguments already supplied:
+    for every scene in manifest.scene_plan.scenes (exact stored order,
+    never sorted), resolve exactly one eligible audio and one eligible
+    animation artifact and turn each into an absolute path. Mirrors
+    src.core.scene_timing_finalizer.finalize_scene_timing()'s own
+    by-scene grouping pattern exactly, generalized to two artifact kinds
+    instead of one."""
+    seen_scene_ids: set[str] = set()
+    for scene in manifest.scene_plan.scenes:
+        if scene.scene_id in seen_scene_ids:
+            # Unreachable via load_manifest() — ScenePlan's own validator
+            # already forbids duplicate scene_ids. Defensive only; see
+            # InvalidSceneOrderError's own docstring.
+            raise InvalidSceneOrderError(f"duplicate scene_id {scene.scene_id!r} in manifest scene order")
+        seen_scene_ids.add(scene.scene_id)
+
+    def _by_scene(artifacts: Sequence[ArtifactRecord], kind: str) -> dict[str, list[ArtifactRecord]]:
+        grouped: dict[str, list[ArtifactRecord]] = {}
+        for artifact in artifacts:
+            if artifact.kind != kind:
+                continue
+            if artifact.project_id != manifest.project_id:
+                continue
+            grouped.setdefault(artifact.scene_id, []).append(artifact)
+        return grouped
+
+    audio_by_scene = _by_scene(audio_artifacts, "audio")
+    animation_by_scene = _by_scene(animation_artifacts, "animation")
+
+    def _resolve_one(grouped: dict[str, list[ArtifactRecord]], scene_id: str, kind: str) -> ArtifactRecord:
+        matches = grouped.get(scene_id, [])
+        if len(matches) == 0:
+            raise MissingSceneArtifactError(
+                f"scene {scene_id!r} has no eligible registered {kind!r} artifact"
+            )
+        if len(matches) > 1:
+            raise AmbiguousSceneArtifactError(
+                f"scene {scene_id!r} has {len(matches)} eligible registered {kind!r} artifacts "
+                "(expected exactly 1)"
+            )
+        return matches[0]
+
+    resolved: list[_SceneSourcePaths] = []
+    for scene in manifest.scene_plan.scenes:
+        animation_artifact = _resolve_one(animation_by_scene, scene.scene_id, "animation")
+        audio_artifact = _resolve_one(audio_by_scene, scene.scene_id, "audio")
+
+        animation_path = resolve_under_project_dir(project_dir_resolved, animation_artifact.relative_path)
+        if animation_path is None:
+            raise ArtifactFileNotFoundError(
+                f"registered animation artifact path for scene {scene.scene_id!r} is unsafe"
+            )
+        audio_path = resolve_under_project_dir(project_dir_resolved, audio_artifact.relative_path)
+        if audio_path is None:
+            raise ArtifactFileNotFoundError(
+                f"registered audio artifact path for scene {scene.scene_id!r} is unsafe"
+            )
+
+        for label, path in (("animation", animation_path), ("audio", audio_path)):
+            if not path.exists():
+                raise ArtifactFileNotFoundError(
+                    f"registered {label} artifact file is missing on disk for scene {scene.scene_id!r}"
+                )
+            if not path.is_file():
+                raise ArtifactFileNotFoundError(
+                    f"registered {label} artifact path for scene {scene.scene_id!r} is not a regular file"
+                )
+
+        resolved.append(_SceneSourcePaths(scene_id=scene.scene_id, animation_path=animation_path, audio_path=audio_path))
+
+    return resolved
+
+
+@dataclass(frozen=True)
+class _AssemblyPlan:
+    project_id: str
+    manifest: VideoManifest
+    output_path: Path
+    scene_sources: tuple[_SceneSourcePaths, ...]
+
+
+def _load_assembly_plan(project_id: str, manifest_path: Path, output_path: Path) -> _AssemblyPlan:
+    """Phase A: the only part of this module that opens SQLite, and only
+    for the short duration of this function. Raises a
+    FinalVideoAssemblyError subclass for every rejection; creates nothing
+    on disk and leaves no partial database state on any exit."""
+    if not project_id:
+        raise FinalVideoAssemblyError("project_id must not be empty")
+
+    try:
+        conn = get_readonly_connection()
+    except sqlite3.Error as exc:
+        raise ProjectNotFoundError("no local project database found") from exc
+
+    try:
+        project = get_project(conn, project_id)
+        if project is None:
+            raise ProjectNotFoundError(f"unknown project_id {project_id!r}")
+
+        if not manifest_path.exists():
+            raise ManifestNotFoundError("--manifest does not exist")
+        if not manifest_path.is_file():
+            raise ManifestNotFoundError("--manifest is not a regular file")
+
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestStoreError as exc:
+            raise InvalidManifestError("could not load manifest at --manifest (unreadable or invalid)") from exc
+
+        if manifest.project_id != project_id:
+            raise InvalidManifestError(f"--manifest project_id does not match project_id {project_id!r}")
+        if manifest.source_fingerprint != project.manifest_fingerprint:
+            raise InvalidManifestError(
+                "--manifest source_fingerprint does not match the project registry's recorded fingerprint"
+            )
+
+        if len(manifest.scene_plan.scenes) == 0:
+            raise EmptyManifestError("manifest scene_plan contains no scenes")
+
+        project_dir_resolved = Path(project.manifest_path).resolve().parent
+
+        audio_artifacts = list_artifacts_by_project(conn, project_id, kind="audio")
+        animation_artifacts = list_artifacts_by_project(conn, project_id, kind="animation")
+        scene_sources = _resolve_scene_sources(manifest, audio_artifacts, animation_artifacts, project_dir_resolved)
+
+        output_resolved = Path(output_path).resolve()
+        if output_resolved.exists():
+            raise OutputPathConflictError("--output already exists")
+        if output_resolved.is_dir():
+            raise OutputPathConflictError("--output is a directory")
+        source_paths_resolved = {
+            os.path.normcase(str(s.animation_path)) for s in scene_sources
+        } | {os.path.normcase(str(s.audio_path)) for s in scene_sources}
+        if os.path.normcase(str(output_resolved)) in source_paths_resolved:
+            raise OutputPathConflictError("--output must not be the same path as a scene source artifact")
+
+        existing_render_artifacts = list_artifacts_by_project(conn, project_id, kind="render")
+        if existing_render_artifacts:
+            raise ExistingFinalVideoArtifactError(
+                f"a render artifact is already registered for project {project_id!r} "
+                f"({existing_render_artifacts[0].artifact_id!r}) — this command never replaces an "
+                "existing final-video registration"
+            )
+    finally:
+        conn.close()
+
+    return _AssemblyPlan(
+        project_id=project_id,
+        manifest=manifest,
+        output_path=output_resolved,
+        scene_sources=tuple(scene_sources),
+    )
+
+
+def _prepare_scene_clip(source: _SceneSourcePaths, out_path: Path) -> Path:
+    """Phase B, per scene: mux the registered audio into the animation
+    clip only when it has no audio stream of its own; if it already has
+    one, fail rather than guess whether it is the approved scene audio
+    (see this module's docstring, point 3 of the inspection note)."""
+    try:
+        if _has_audio_stream(source.animation_path):
+            raise SceneMuxError(
+                f"scene {source.scene_id!r}'s registered animation artifact already contains an audio "
+                "stream — this command cannot safely verify it is the approved scene audio, so it "
+                "refuses to guess rather than risk muxing audio twice or using the wrong track"
+            )
+        mux_audio_video(source.animation_path, source.audio_path, out_path)
+    except ProviderError as exc:
+        raise SceneMuxError(f"failed to prepare clip for scene {source.scene_id!r}") from exc
+    return out_path
+
+
+def _assemble_media(plan: _AssemblyPlan, tempdir: Path) -> tuple[Path, float, float]:
+    """Phase B: pure FFmpeg work, no database connection open anywhere in
+    this function. Returns (final_temp_path, measured_duration_seconds,
+    sum_of_prepared_scene_durations) for phase C's registration step and
+    the caller's atomic-replace step. `tempdir` is created and cleaned up
+    by the caller (assemble_final_video), never here — this function may
+    raise at any point partway through, and ownership must stay with a
+    `finally` that is guaranteed to run regardless of where that happens,
+    matching src.core.ken_burns_upscale_pipeline.py's own established
+    tempdir-at-the-outermost-level pattern exactly."""
+    scene_clip_paths: list[Path] = []
+    scene_durations: list[float] = []
+    for index, source in enumerate(plan.scene_sources, start=1):
+        clip_path = tempdir / f"{index:04d}_{_sanitize_for_filename(source.scene_id)}.mp4"
+        _prepare_scene_clip(source, clip_path)
+        try:
+            duration = get_duration_seconds(clip_path)
+        except ProviderError as exc:
+            raise SceneMuxError(f"could not measure prepared clip duration for scene {source.scene_id!r}") from exc
+        if not math.isfinite(duration) or duration <= 0:
+            raise SceneMuxError(f"prepared clip for scene {source.scene_id!r} has an invalid duration")
+        scene_clip_paths.append(clip_path)
+        scene_durations.append(duration)
+
+    final_temp_path = tempdir / "final.mp4"
+    try:
+        concat_videos(scene_clip_paths, final_temp_path)
+    except ProviderError as exc:
+        raise FinalConcatError("final concatenation failed") from exc
+
+    if not final_temp_path.exists():
+        raise InvalidFinalOutputError("concatenation did not produce an output file")
+    if not final_temp_path.is_file():
+        raise InvalidFinalOutputError("concatenation output is not a regular file")
+    if final_temp_path.stat().st_size == 0:
+        raise InvalidFinalOutputError("concatenation output is empty")
+
+    try:
+        final_duration = get_duration_seconds(final_temp_path)
+    except ProviderError as exc:
+        raise InvalidFinalOutputError("could not measure final output duration") from exc
+    if not math.isfinite(final_duration) or final_duration <= 0:
+        raise InvalidFinalOutputError("final output has an invalid duration")
+
+    expected_total = sum(scene_durations)
+    tolerance = _duration_tolerance_seconds(len(plan.scene_sources))
+    if abs(final_duration - expected_total) > tolerance:
+        raise InvalidFinalOutputError(
+            f"final duration {final_duration:.3f}s does not match the sum of prepared scene "
+            f"durations {expected_total:.3f}s within tolerance {tolerance:.3f}s"
+        )
+
+    return final_temp_path, final_duration, expected_total
+
+
+def assemble_final_video(project_id: str, manifest_path: Path, output_path: Path) -> FinalVideoAssemblyResult:
+    """Generate one final MP4 for `project_id` at `output_path` by
+    concatenating every scene's already-registered animation+audio
+    artifacts, in manifest order, and register the result as this
+    project's canonical "render" artifact. Raises a
+    FinalVideoAssemblyError subclass and leaves no new file or database
+    row behind on any rejection or failure — see this module's docstring
+    for the full three-part lifecycle and cleanup proof."""
+    plan = _load_assembly_plan(project_id, Path(manifest_path), Path(output_path))
+
+    plan.output_path.parent.mkdir(parents=True, exist_ok=True)
+    tempdir = Path(tempfile.mkdtemp(prefix="final-video-assembly-", dir=plan.output_path.parent))
+
+    output_created = False
+    registration_succeeded = False
+    try:
+        final_temp_path, final_duration, _expected_total = _assemble_media(plan, tempdir)
+
+        os.replace(final_temp_path, plan.output_path)
+        output_created = True
+
+        try:
+            conn = get_connection()
+        except sqlite3.Error as exc:
+            raise FinalArtifactRegistrationError("no local project database found") from exc
+
+        try:
+            existing = list_artifacts_by_project(conn, plan.project_id, kind="render")
+            if existing:
+                raise ExistingFinalVideoArtifactError(
+                    f"a render artifact was registered for project {plan.project_id!r} "
+                    f"({existing[0].artifact_id!r}) while this command was running"
+                )
+
+            project = get_project(conn, plan.project_id)
+            if project is None:
+                raise ProjectNotFoundError(f"unknown project_id {plan.project_id!r}")
+
+            try:
+                result = register_render_artifact(conn, project, plan.manifest, plan.output_path, now=datetime.now(timezone.utc))
+            except Exception as exc:
+                raise FinalArtifactRegistrationError("final artifact registration failed") from exc
+
+            if not result.ok:
+                raise FinalArtifactRegistrationError(
+                    "final artifact registration was rejected: " + "; ".join(result.reasons)
+                )
+        finally:
+            conn.close()
+
+        registration_succeeded = True
+    finally:
+        shutil.rmtree(tempdir, ignore_errors=True)
+        if output_created and not registration_succeeded:
+            try:
+                plan.output_path.unlink()
+            except OSError:
+                pass
+
+    return FinalVideoAssemblyResult(
+        project_id=plan.project_id,
+        output_path=plan.output_path,
+        scene_count=len(plan.scene_sources),
+        measured_duration_seconds=final_duration,
+        artifact_id=result.artifact_id,
+    )
