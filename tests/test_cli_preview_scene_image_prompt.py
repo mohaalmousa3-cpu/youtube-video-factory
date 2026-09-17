@@ -1,6 +1,6 @@
 """Tests for the `preview-scene-image-prompt` CLI command (src/cli.py
 cmd_preview_scene_image_prompt). Same isolated_db / _create_registered_project
-pattern as tests/test_cli_mouth_animation_preflight.py, minus visual/audio
+pattern as tests/test_cli_build_scene_audio.py, minus visual/audio
 artifact registration — this command never looks up an artifact. No
 provider, no image decode, no file creation, no network anywhere in this
 file."""
@@ -528,7 +528,7 @@ def test_cli_never_creates_the_output_file(isolated_db, tmp_path, capsys):
 
 def test_cli_closes_readonly_connection_before_preview_work(isolated_db, tmp_path, capsys, monkeypatch):
     """Same closure-proof technique as
-    test_cli_mouth_animation_preflight.py's analogous test: a closed
+    test_cli_build_upscaled_ken_burns.py's analogous test: a closed
     sqlite3 connection raises ProgrammingError on further use, so a mocked
     build_scene_image_preview() tries to reuse the CLI's own connection
     object and records whether that raised."""

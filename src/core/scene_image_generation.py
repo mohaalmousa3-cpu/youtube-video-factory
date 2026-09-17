@@ -42,7 +42,7 @@ holds for any exception raised from the provider call onward (a
 ProviderError, a Pillow decode failure, an unexpected format, or any other
 exception type), via a success-flag + `finally` (never a bare `except
 Exception`), matching src.core.ken_burns_upscale_pipeline.py's and
-src.core.limb_sway_generation.py's own cleanup pattern exactly.
+src.core.scene_audio_generation.py's own cleanup pattern exactly.
 
 Errors from the provider are translated into one domain exception,
 SceneImageGenerationError, with a short, fixed message per failure

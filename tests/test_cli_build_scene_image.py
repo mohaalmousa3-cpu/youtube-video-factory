@@ -198,9 +198,8 @@ def test_existing_commands_remain_registered():
         "p", "s", "--manifest", "m", "--reference-image", "r", "--output", "o", "--include-character", "true",
     ]).func is cli.cmd_preview_scene_image_prompt
     assert parser.parse_args([
-        "build-limb-sway-clip", "p", "s", "--manifest", "m", "--limb-box", "1,2,3,4,5,6",
-        "--sway-amplitude-degrees", "5", "--frame-count", "3", "--output", "o",
-    ]).func is cli.cmd_build_limb_sway_clip
+        "build-upscaled-ken-burns", "p", "s", "--manifest", "m", "--output", "o",
+    ]).func is cli.cmd_build_upscaled_ken_burns
     assert parser.parse_args(["health"]).func is cli.cmd_health
 
 
