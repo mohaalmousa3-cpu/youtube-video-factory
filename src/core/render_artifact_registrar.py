@@ -92,6 +92,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 
 from src.core.path_safety import resolve_under_project_dir
 from src.database.artifact_repository import (
@@ -197,6 +198,74 @@ def _validate_video(source_file: Path) -> tuple[float | None, str | None]:
     return duration, None
 
 
+class RenderSourceValidationError(Exception):
+    """Raised by prevalidate_render_source() when `source_file` cannot be
+    validated as playable video with the required stream layout — exactly
+    the same checks register_render_artifact() has always performed via
+    _validate_video() above, just made callable on their own, before any
+    SQLite connection is opened."""
+
+
+class RenderSourceMismatchError(Exception):
+    """Raised by register_render_artifact() when a supplied `prevalidated`
+    result no longer matches the actual file at `source_file` — e.g. the
+    file was replaced or modified after prevalidate_render_source() ran.
+    register_render_artifact() never trusts a caller-supplied prevalidated
+    result without re-confirming its size and checksum via a fresh, local,
+    non-subprocess file read first; this is the "caller/input
+    inconsistency it will not silently work around" case, the same class
+    of failure RenderArtifactRegistrationError documents for the
+    project/manifest identity check above."""
+
+
+@dataclass(frozen=True)
+class PrevalidatedRenderSource:
+    """The result of prevalidate_render_source(): local file/media facts
+    about one render source file, computed WITHOUT any open SQLite
+    connection. Passing this into register_render_artifact()'s
+    `prevalidated` parameter lets a caller (see
+    src.core.final_video_assembly) skip re-running ffprobe — a subprocess
+    call — while a database connection is open; register_render_artifact()
+    still re-confirms the file's current size and checksum (pure, local,
+    no subprocess) before trusting any of these values, rather than
+    trusting an arbitrary caller-supplied result outright."""
+
+    source_path: Path
+    byte_size: int
+    sha256_checksum: str
+    duration_seconds: float
+
+
+def prevalidate_render_source(source_file: Path) -> PrevalidatedRenderSource:
+    """Pure, local, no SQLite connection anywhere in this function:
+    validate `source_file` exactly as register_render_artifact() has
+    always validated a render source (existence, regular file, non-empty,
+    measurable duration, at least one video stream) and return its
+    measured facts. Raises RenderSourceValidationError on any validation
+    failure, with the same sanitized, fixed-shape messages
+    register_render_artifact()'s own rejections already use — never raw
+    ffprobe stderr."""
+    if not source_file.exists():
+        raise RenderSourceValidationError(f"source file does not exist at {source_file}")
+    if not source_file.is_file():
+        raise RenderSourceValidationError(f"source file at {source_file} is not a regular file")
+    size = source_file.stat().st_size
+    if size == 0:
+        raise RenderSourceValidationError(f"source file at {source_file} is empty")
+    checksum = _sha256_of_file(source_file)
+
+    duration_seconds, video_error = _validate_video(source_file)
+    if video_error is not None:
+        raise RenderSourceValidationError(video_error)
+
+    return PrevalidatedRenderSource(
+        source_path=source_file.resolve(),
+        byte_size=size,
+        sha256_checksum=checksum,
+        duration_seconds=duration_seconds,
+    )
+
+
 def _cleanup_fresh_copy(destination: Path, created_fresh_copy: bool) -> None:
     """Delete `destination` only if THIS call is the one that just created
     it fresh — never a pre-existing file the call found already in place.
@@ -217,6 +286,8 @@ def register_render_artifact(
     source_file: Path,
     *,
     now: datetime | None = None,
+    prevalidated: PrevalidatedRenderSource | None = None,
+    metadata_overrides: Mapping[str, str | int | float | bool | None] | None = None,
 ) -> RenderArtifactRegistrationResult:
     """Register `source_file` as this project's canonical, project-level
     "render" artifact. Writes nothing to SQLite or the filesystem on any
@@ -224,7 +295,30 @@ def register_render_artifact(
     write points a successful, non-idempotent call may reach.
     Stage-agnostic: never reads or checks project.current_stage. Takes no
     scene_id — "render" is project-level, not scene-level; see this
-    module's docstring."""
+    module's docstring.
+
+    `prevalidated` (optional, keyword-only): when supplied, skips
+    re-running the ffprobe-based video validation this function would
+    otherwise perform, using `prevalidated.duration_seconds` instead —
+    for a caller (see src.core.final_video_assembly) that already ran
+    prevalidate_render_source() on `source_file` before opening this
+    call's SQLite connection, so no ffprobe/ffmpeg subprocess call ever
+    happens while that connection is open. The size and checksum this
+    function already computes for `source_file` are compared against
+    `prevalidated.byte_size`/`.sha256_checksum` first (a pure, local,
+    non-subprocess file read — never a raw boolean trusted blindly); a
+    mismatch raises RenderSourceMismatchError rather than silently
+    re-validating or falling back. Every existing caller that omits this
+    parameter (the default, `None`) gets exactly the same behavior as
+    before this parameter existed — full ffprobe validation, every time.
+
+    `metadata_overrides` (optional, keyword-only): merged into (and
+    taking precedence over) the default `{"duration_seconds": ...,
+    "source": "external"}` metadata this function has always recorded —
+    for a caller that wants additional scalar-only metadata fields (e.g.
+    scene_count, a manifest identifier) without this function adding a
+    new database column or changing its own default metadata shape for
+    every other caller that omits this parameter."""
     when = now if now is not None else datetime.now(timezone.utc)
     if manifest.project_id != project.project_id:
         raise RenderArtifactRegistrationError(
@@ -323,7 +417,20 @@ def register_render_artifact(
     else:
         final_checksum, final_size = None, None  # computed after the copy below
 
-    duration_seconds, video_error = _validate_video(source_file)
+    if prevalidated is not None:
+        # Pure, local, non-subprocess reconfirmation — never trust a
+        # caller-supplied prevalidated result outright. source_checksum/
+        # source_size above were already computed unconditionally, so
+        # this is just a comparison, not additional file I/O.
+        if source_checksum != prevalidated.sha256_checksum or source_size != prevalidated.byte_size:
+            raise RenderSourceMismatchError(
+                f"prevalidated result for {prevalidated.source_path} no longer matches the current "
+                f"content of {source_file} (size/checksum changed since prevalidation) — refusing to "
+                "trust a stale prevalidation result"
+            )
+        duration_seconds, video_error = prevalidated.duration_seconds, None
+    else:
+        duration_seconds, video_error = _validate_video(source_file)
     if video_error is not None:
         return _result(ok=False, reasons=(video_error,))
 
@@ -337,6 +444,10 @@ def register_render_artifact(
         final_size = destination.stat().st_size
         final_checksum = _sha256_of_file(destination)  # hash the COPY, not the source
 
+    metadata = {"duration_seconds": duration_seconds, "source": "external"}
+    if metadata_overrides is not None:
+        metadata.update(metadata_overrides)
+
     record = ArtifactRecord(
         artifact_id=_ARTIFACT_ID,
         project_id=project.project_id,
@@ -346,7 +457,7 @@ def register_render_artifact(
         byte_size=final_size,
         sha256_checksum=final_checksum,
         created_at=when,
-        metadata={"duration_seconds": duration_seconds, "source": "external"},
+        metadata=metadata,
     )
 
     try:

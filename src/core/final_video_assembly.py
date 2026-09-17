@@ -94,7 +94,13 @@ from typing import Sequence
 
 from src.core.manifest_store import ManifestStoreError, load_manifest
 from src.core.path_safety import resolve_under_project_dir
-from src.core.render_artifact_registrar import register_render_artifact
+from src.core.render_artifact_registrar import (
+    PrevalidatedRenderSource,
+    RenderSourceMismatchError,
+    RenderSourceValidationError,
+    prevalidate_render_source,
+    register_render_artifact,
+)
 from src.database.artifact_repository import list_artifacts_by_project
 from src.database.db import get_connection, get_readonly_connection
 from src.database.project_repository import get_project
@@ -171,6 +177,23 @@ class ExistingFinalVideoArtifactError(FinalVideoAssemblyError):
     work, rather than discovered only after."""
 
 
+class MediaProbeError(FinalVideoAssemblyError):
+    """A local ffprobe stream-type probe could not be completed and
+    parsed — the ffprobe binary is missing/unusable, it exited non-zero,
+    produced empty or malformed output, or the JSON structure was not the
+    expected shape. Never raised to mean "no such stream" — that is a
+    fail-open interpretation this module deliberately refuses to make;
+    see _probe_stream_types()'s own docstring."""
+
+
+class FinalVideoCleanupError(FinalVideoAssemblyError):
+    """A temporary-directory or orphaned-output cleanup step failed after
+    a primary assembly/registration failure. Raised (never silently
+    swallowed) so a corrupted or incompletely-cleaned-up state is always
+    discoverable — see assemble_final_video()'s own docstring for the
+    cleanup contract this protects."""
+
+
 class SceneMuxError(FinalVideoAssemblyError):
     """Preparing one scene's clip (audio-stream inspection or muxing)
     failed."""
@@ -228,32 +251,62 @@ def _duration_tolerance_seconds(scene_count: int) -> float:
     return max(0.25, 0.05 * scene_count)
 
 
-def _has_audio_stream(media_path: Path) -> bool:
-    """Local, read-only ffprobe query for whether `media_path` already
-    contains an audio stream — same ffprobe-path derivation pattern
-    get_duration_seconds()/animation_artifact_registrar.py's own
-    _has_video_stream() use, duplicated here rather than added to
-    ffmpeg_render.py, matching this codebase's explicit, established
-    convention of small self-contained duplicates for this exact
-    ffprobe-stream-check shape (see animation_artifact_registrar.py's own
-    docstring for that precedent). Returns False on any ffprobe failure —
-    the caller has already proven the file is valid, probeable media via
-    get_duration_seconds() before this is ever called."""
+def _probe_stream_types(media_path: Path) -> frozenset[str]:
+    """Strict, fail-closed local ffprobe stream-type probe. Returns the
+    set of codec_type values (e.g. {"video"}, {"video", "audio"})
+    actually present in `media_path`, proven by a successfully parsed
+    ffprobe run. Raises MediaProbeError, chaining the original exception
+    as __cause__ where one exists, for EVERY failure mode: an unreadable/
+    missing ffprobe binary (OSError/FileNotFoundError), a timeout, a
+    non-zero exit, empty output, malformed JSON, or a JSON document that
+    is not the expected {"streams": [{"codec_type": ...}, ...]} shape.
+
+    Deliberately the opposite of animation_artifact_registrar.py's own
+    _has_video_stream()/render_artifact_registrar.py's own
+    _has_video_stream(), both of which return False on any probe
+    failure (a defensible fail-open choice there, since both already
+    require a prior successful get_duration_seconds() call on the same
+    file before ever being invoked). This module cannot make that same
+    assumption — an animation artifact's audio-stream presence is a
+    yes/no safety gate that decides whether narration gets muxed in or
+    skipped, so an unknown probe result must never be silently read as
+    "no audio"; it must fail the whole call instead."""
     ffmpeg_path = Path(get_settings().ffmpeg_path)
     ffprobe_name = "ffprobe.exe" if ffmpeg_path.suffix == ".exe" else "ffprobe"
     ffprobe = str(ffmpeg_path.with_name(ffprobe_name))
-    result = subprocess.run(
-        [ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(media_path)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return False
     try:
-        streams = json.loads(result.stdout).get("streams", [])
-    except (json.JSONDecodeError, AttributeError):
-        return False
-    return any(stream.get("codec_type") == "audio" for stream in streams)
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(media_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise MediaProbeError(f"could not run ffprobe to inspect media streams for {media_path.name!r}") from exc
+
+    if result.returncode != 0:
+        raise MediaProbeError(f"ffprobe exited with an error while inspecting {media_path.name!r}")
+    if not result.stdout or not result.stdout.strip():
+        raise MediaProbeError(f"ffprobe produced no output while inspecting {media_path.name!r}")
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise MediaProbeError(f"ffprobe produced malformed JSON while inspecting {media_path.name!r}") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("streams"), list):
+        raise MediaProbeError(f"ffprobe produced an unexpected JSON structure while inspecting {media_path.name!r}")
+
+    stream_types: set[str] = set()
+    for stream in payload["streams"]:
+        if not isinstance(stream, dict):
+            raise MediaProbeError(
+                f"ffprobe produced an unexpected stream entry while inspecting {media_path.name!r}"
+            )
+        codec_type = stream.get("codec_type")
+        if isinstance(codec_type, str):
+            stream_types.add(codec_type)
+    return frozenset(stream_types)
 
 
 def _resolve_scene_sources(
@@ -420,17 +473,33 @@ def _prepare_scene_clip(source: _SceneSourcePaths, out_path: Path) -> Path:
     """Phase B, per scene: mux the registered audio into the animation
     clip only when it has no audio stream of its own; if it already has
     one, fail rather than guess whether it is the approved scene audio
-    (see this module's docstring, point 3 of the inspection note)."""
+    (see this module's docstring, point 3 of the inspection note). Every
+    stream-presence check here is strict (_probe_stream_types(), never
+    the old fail-open helper) — a probe failure raises MediaProbeError
+    and is never read as "no such stream"."""
+    animation_stream_types = _probe_stream_types(source.animation_path)
+    if "video" not in animation_stream_types:
+        raise SceneMuxError(
+            f"scene {source.scene_id!r}'s registered animation artifact has no video stream"
+        )
+    if "audio" in animation_stream_types:
+        raise SceneMuxError(
+            f"scene {source.scene_id!r}'s registered animation artifact already contains an audio "
+            "stream — this command cannot safely verify it is the approved scene audio, so it "
+            "refuses to guess rather than risk muxing audio twice or using the wrong track"
+        )
+
     try:
-        if _has_audio_stream(source.animation_path):
-            raise SceneMuxError(
-                f"scene {source.scene_id!r}'s registered animation artifact already contains an audio "
-                "stream — this command cannot safely verify it is the approved scene audio, so it "
-                "refuses to guess rather than risk muxing audio twice or using the wrong track"
-            )
         mux_audio_video(source.animation_path, source.audio_path, out_path)
     except ProviderError as exc:
         raise SceneMuxError(f"failed to prepare clip for scene {source.scene_id!r}") from exc
+
+    prepared_stream_types = _probe_stream_types(out_path)
+    if "video" not in prepared_stream_types or "audio" not in prepared_stream_types:
+        raise SceneMuxError(
+            f"prepared clip for scene {source.scene_id!r} is missing a required video or audio "
+            "stream after muxing"
+        )
     return out_path
 
 
@@ -478,6 +547,15 @@ def _assemble_media(plan: _AssemblyPlan, tempdir: Path) -> tuple[Path, float, fl
     if not math.isfinite(final_duration) or final_duration <= 0:
         raise InvalidFinalOutputError("final output has an invalid duration")
 
+    # Duration alone does not prove a valid final audiovisual output — a
+    # video-only or audio-only concatenation could still report a
+    # plausible duration. Strict probing closes that gap.
+    final_stream_types = _probe_stream_types(final_temp_path)
+    if "video" not in final_stream_types:
+        raise InvalidFinalOutputError("final output has no video stream")
+    if "audio" not in final_stream_types:
+        raise InvalidFinalOutputError("final output has no audio stream")
+
     expected_total = sum(scene_durations)
     tolerance = _duration_tolerance_seconds(len(plan.scene_sources))
     if abs(final_duration - expected_total) > tolerance:
@@ -496,7 +574,24 @@ def assemble_final_video(project_id: str, manifest_path: Path, output_path: Path
     project's canonical "render" artifact. Raises a
     FinalVideoAssemblyError subclass and leaves no new file or database
     row behind on any rejection or failure — see this module's docstring
-    for the full three-part lifecycle and cleanup proof."""
+    for the full three-part lifecycle and cleanup proof.
+
+    Phase C never runs ffprobe while its SQLite connection is open:
+    prevalidate_render_source() (pure, local, no SQLite) runs on the
+    already-placed --output file BEFORE get_connection() is ever called,
+    and its result is handed to register_render_artifact() via the
+    `prevalidated` parameter, which itself only re-confirms size/checksum
+    (plain file reads, not a subprocess) rather than re-running ffprobe.
+
+    Cleanup failures are never silently swallowed. If temp-directory or
+    orphaned-output removal fails while a primary assembly/registration
+    exception is already propagating, that failure is attached to the
+    primary exception via add_note() (Python 3.11+) rather than replacing
+    it — the original, actionable failure stays the one callers see and
+    catch. If cleanup fails with no primary exception in flight (a
+    cleanup-only failure after an otherwise-complete run), it is raised
+    directly as FinalVideoCleanupError, since there is nothing else to
+    preserve."""
     plan = _load_assembly_plan(project_id, Path(manifest_path), Path(output_path))
 
     plan.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -504,49 +599,102 @@ def assemble_final_video(project_id: str, manifest_path: Path, output_path: Path
 
     output_created = False
     registration_succeeded = False
+    primary_exc: Exception | None = None
+    result = None
+    final_duration = None
     try:
-        final_temp_path, final_duration, _expected_total = _assemble_media(plan, tempdir)
-
-        os.replace(final_temp_path, plan.output_path)
-        output_created = True
-
         try:
-            conn = get_connection()
-        except sqlite3.Error as exc:
-            raise FinalArtifactRegistrationError("no local project database found") from exc
+            final_temp_path, final_duration, _expected_total = _assemble_media(plan, tempdir)
 
-        try:
-            existing = list_artifacts_by_project(conn, plan.project_id, kind="render")
-            if existing:
-                raise ExistingFinalVideoArtifactError(
-                    f"a render artifact was registered for project {plan.project_id!r} "
-                    f"({existing[0].artifact_id!r}) while this command was running"
-                )
+            os.replace(final_temp_path, plan.output_path)
+            output_created = True
 
-            project = get_project(conn, plan.project_id)
-            if project is None:
-                raise ProjectNotFoundError(f"unknown project_id {plan.project_id!r}")
+            # Pure, local, no SQLite connection open anywhere in this
+            # call — the only ffprobe work phase C needs, done BEFORE
+            # get_connection() below.
+            try:
+                prevalidated = prevalidate_render_source(plan.output_path)
+            except RenderSourceValidationError as exc:
+                raise InvalidFinalOutputError("final output failed pre-registration validation") from exc
 
             try:
-                result = register_render_artifact(conn, project, plan.manifest, plan.output_path, now=datetime.now(timezone.utc))
-            except Exception as exc:
-                raise FinalArtifactRegistrationError("final artifact registration failed") from exc
+                conn = get_connection()
+            except sqlite3.Error as exc:
+                raise FinalArtifactRegistrationError("no local project database found") from exc
 
-            if not result.ok:
-                raise FinalArtifactRegistrationError(
-                    "final artifact registration was rejected: " + "; ".join(result.reasons)
-                )
-        finally:
-            conn.close()
+            try:
+                existing = list_artifacts_by_project(conn, plan.project_id, kind="render")
+                if existing:
+                    raise ExistingFinalVideoArtifactError(
+                        f"a render artifact was registered for project {plan.project_id!r} "
+                        f"({existing[0].artifact_id!r}) while this command was running"
+                    )
 
-        registration_succeeded = True
+                project = get_project(conn, plan.project_id)
+                if project is None:
+                    raise ProjectNotFoundError(f"unknown project_id {plan.project_id!r}")
+
+                metadata_overrides = {
+                    "source": "final-video-assembly-v1",
+                    "scene_count": len(plan.scene_sources),
+                    "manifest_fingerprint": plan.manifest.source_fingerprint,
+                }
+                try:
+                    result = register_render_artifact(
+                        conn,
+                        project,
+                        plan.manifest,
+                        plan.output_path,
+                        now=datetime.now(timezone.utc),
+                        prevalidated=prevalidated,
+                        metadata_overrides=metadata_overrides,
+                    )
+                except RenderSourceMismatchError as exc:
+                    raise FinalArtifactRegistrationError(
+                        "final output changed unexpectedly between pre-validation and registration"
+                    ) from exc
+                except Exception as exc:
+                    raise FinalArtifactRegistrationError("final artifact registration failed") from exc
+
+                if not result.ok:
+                    raise FinalArtifactRegistrationError(
+                        "final artifact registration was rejected: " + "; ".join(result.reasons)
+                    )
+            finally:
+                conn.close()
+
+            registration_succeeded = True
+        except Exception as exc:
+            primary_exc = exc
+            raise
     finally:
-        shutil.rmtree(tempdir, ignore_errors=True)
+        try:
+            shutil.rmtree(tempdir)
+        except OSError as cleanup_exc:
+            if primary_exc is not None:
+                primary_exc.add_note(
+                    f"additionally, failed to remove temporary assembly directory {tempdir}: "
+                    f"{type(cleanup_exc).__name__}"
+                )
+            else:
+                raise FinalVideoCleanupError(
+                    f"failed to remove temporary assembly directory {tempdir}"
+                ) from cleanup_exc
+
         if output_created and not registration_succeeded:
             try:
                 plan.output_path.unlink()
-            except OSError:
-                pass
+            except OSError as cleanup_exc:
+                if primary_exc is not None:
+                    primary_exc.add_note(
+                        f"additionally, failed to remove the orphaned output at {plan.output_path}: "
+                        f"{type(cleanup_exc).__name__}"
+                    )
+                else:
+                    raise FinalVideoCleanupError(
+                        f"registration failed and the orphaned output at {plan.output_path} "
+                        "could not be removed"
+                    ) from cleanup_exc
 
     return FinalVideoAssemblyResult(
         project_id=plan.project_id,

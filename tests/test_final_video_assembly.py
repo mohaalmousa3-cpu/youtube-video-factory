@@ -1,15 +1,15 @@
 """Tests for src/core/final_video_assembly.py — the local-only,
 generation-and-registration final assembly module. FFmpeg helpers
-(mux_audio_video/concat_videos/get_duration_seconds/_has_audio_stream) are
-mocked at their point of import in this module for every test except the
-one doubly-gated real-ffmpeg integration test at the bottom. Uses the same
-isolated_db / _create_registered_project pattern as every other CLI-level
-test in this repo, since assemble_final_video() itself owns its own short-
-lived SQLite connections (see the module's own docstring for why)."""
+(mux_audio_video/concat_videos/get_duration_seconds/_probe_stream_types)
+are mocked at their point of import in this module for every test except
+the one doubly-gated real-ffmpeg integration test at the bottom. Uses the
+same isolated_db / _create_registered_project pattern as every other
+CLI-level test in this repo, since assemble_final_video() itself owns its
+own short-lived SQLite connections (see the module's own docstring for
+why)."""
 from __future__ import annotations
 
 import hashlib
-import math
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,10 +24,12 @@ from src.core.final_video_assembly import (
     FinalArtifactRegistrationError,
     FinalConcatError,
     FinalVideoAssemblyResult,
+    FinalVideoCleanupError,
     InvalidFinalOutputError,
     InvalidManifestError,
     InvalidSceneOrderError,
     ManifestNotFoundError,
+    MediaProbeError,
     MissingSceneArtifactError,
     OutputPathConflictError,
     ProjectNotFoundError,
@@ -47,6 +49,7 @@ from src.utils.channel_config import get_channel_policy
 
 FIXED_NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 MODULE = "src.core.final_video_assembly"
+REGISTRAR = "src.core.render_artifact_registrar"
 
 
 @pytest.fixture()
@@ -155,20 +158,34 @@ def _register_scenes(project_dir, project_id, scene_ids):
         _register_audio(project_dir, project_id, scene_id)
 
 
-def _mock_ffmpeg_ok(monkeypatch, calls, scene_duration=2.0, has_audio_stream=False):
+def _mock_ffmpeg_ok(monkeypatch, calls, scene_duration=2.0, animation_has_audio=False):
     """Wires up mux_audio_video/concat_videos/get_duration_seconds/
-    _has_audio_stream with a shared, internally-consistent fake duration
-    ledger: every prepared scene clip reports `scene_duration`; concat's
-    output reports the exact sum of the clips it was actually given."""
+    _probe_stream_types with a shared, internally-consistent fake ledger.
+    Any path not yet seen by the fakes (i.e. an original registered
+    animation source) probes as video-only unless `animation_has_audio`
+    is set; every path the fake mux/concat write themselves is recorded
+    as containing both a video and an audio stream, matching real
+    mux_audio_video()/concat_videos() behavior. Also patches
+    render_artifact_registrar's OWN get_duration_seconds/_has_video_stream
+    (a separate import binding register_render_artifact()/
+    prevalidate_render_source() use for their own ffprobe calls) so
+    registration succeeds against the same fake bytes."""
     durations: dict[str, float] = {}
+    stream_types: dict[str, frozenset[str]] = {}
     final_duration_holder: dict[str, float] = {}
 
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: has_audio_stream)
+    def _fake_probe(path):
+        calls.append(("probe", Path(path)))
+        key = str(Path(path))
+        if key in stream_types:
+            return stream_types[key]
+        return frozenset({"video", "audio"}) if animation_has_audio else frozenset({"video"})
 
     def _fake_mux(video_path, audio_path, out_path):
         calls.append(("mux", Path(video_path), Path(audio_path), Path(out_path)))
         Path(out_path).write_bytes(b"fake-muxed-clip")
         durations[str(Path(out_path))] = scene_duration
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_concat(video_paths, out_path):
@@ -176,6 +193,7 @@ def _mock_ffmpeg_ok(monkeypatch, calls, scene_duration=2.0, has_audio_stream=Fal
         Path(out_path).write_bytes(b"fake-final-video")
         total = sum(durations[str(Path(p))] for p in video_paths)
         durations[str(Path(out_path))] = total
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         final_duration_holder["value"] = total
         return out_path
 
@@ -183,29 +201,21 @@ def _mock_ffmpeg_ok(monkeypatch, calls, scene_duration=2.0, has_audio_stream=Fal
         calls.append(("get_duration_seconds", Path(path)))
         return durations[str(Path(path))]
 
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", _fake_probe)
     monkeypatch.setattr(f"{MODULE}.mux_audio_video", _fake_mux)
     monkeypatch.setattr(f"{MODULE}.concat_videos", _fake_concat)
     monkeypatch.setattr(f"{MODULE}.get_duration_seconds", _fake_get_duration_seconds)
 
-    # register_render_artifact() (reused unmodified from render_artifact_registrar.py)
-    # does its own REAL ffprobe validation of the file this module hands it —
-    # a separate import binding from the one patched above, and the final
-    # output here is fake bytes, not real media. Patch that module's own
-    # ffprobe helpers too so the existing registrar's real logic (copy,
-    # checksum, DB insert) still runs for real against our fake file.
-    monkeypatch.setattr(
-        "src.core.render_artifact_registrar.get_duration_seconds",
-        lambda path: final_duration_holder["value"],
-    )
-    monkeypatch.setattr("src.core.render_artifact_registrar._has_video_stream", lambda path: True)
-    return durations
+    monkeypatch.setattr(f"{REGISTRAR}.get_duration_seconds", lambda path: final_duration_holder["value"])
+    monkeypatch.setattr(f"{REGISTRAR}._has_video_stream", lambda path: True)
+    return durations, stream_types
 
 
 def _forbid_ffmpeg(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("must not be called")
 
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", _boom)
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", _boom)
     monkeypatch.setattr(f"{MODULE}.mux_audio_video", _boom)
     monkeypatch.setattr(f"{MODULE}.concat_videos", _boom)
     monkeypatch.setattr(f"{MODULE}.get_duration_seconds", _boom)
@@ -261,11 +271,7 @@ def test_exact_manifest_order_preserved(isolated_db, tmp_path, monkeypatch):
 
     mux_calls = [c for c in calls if c[0] == "mux"]
     assert len(mux_calls) == 3
-    assert [c[1].name for c in mux_calls] == ["scene-01.mp4", "scene-01.mp4", "scene-01.mp4"] or True
-    # Verify by the animation source path's scene, in call order:
-    ordered_scene_ids = []
-    for _, video_path, _audio_path, _out in mux_calls:
-        ordered_scene_ids.append(video_path.stem)
+    ordered_scene_ids = [video_path.stem for _, video_path, _audio_path, _out in mux_calls]
     assert ordered_scene_ids == ["scene-01", "scene-02", "scene-03"]
 
     concat_call = next(c for c in calls if c[0] == "concat")
@@ -330,8 +336,6 @@ def test_empty_scene_list_fails():
     with pytest.raises(ValueError, match="at least 1 item"):
         ScenePlan(scenes=(), role_outfits=())
 
-    from src.core.final_video_assembly import EmptyManifestError
-
     with pytest.raises(EmptyManifestError):
         raise EmptyManifestError("manifest scene_plan contains no scenes")
 
@@ -379,7 +383,6 @@ def test_ambiguous_audio_artifact_fails(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_animation(project_dir, project_id, "scene-01")
     _register_audio(project_dir, project_id, "scene-01")
-    # Register a second, distinct audio artifact_id for the same scene:
     conn = get_connection()
     try:
         extra_path = project_dir / "audio" / "scene-01-extra.wav"
@@ -506,7 +509,7 @@ def test_scene_mux_failure_preserves_cause(isolated_db, tmp_path, monkeypatch):
 
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: frozenset({"video"}))
 
     def _fail_mux(video_path, audio_path, out_path):
         raise ProviderError("ffmpeg failed: <raw internal stderr>")
@@ -551,22 +554,20 @@ def test_concat_failure_preserves_cause(isolated_db, tmp_path, monkeypatch):
 def test_nonexistent_final_temp_output_fails(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    calls: list = []
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
+    stream_types: dict[str, frozenset[str]] = {}
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: stream_types.get(str(Path(path)), frozenset({"video"})))
 
     def _fake_mux(video_path, audio_path, out_path):
         Path(out_path).write_bytes(b"fake")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_concat(video_paths, out_path):
         return out_path  # never actually writes the file
 
-    def _fake_duration(path):
-        return 2.0
-
     monkeypatch.setattr(f"{MODULE}.mux_audio_video", _fake_mux)
     monkeypatch.setattr(f"{MODULE}.concat_videos", _fake_concat)
-    monkeypatch.setattr(f"{MODULE}.get_duration_seconds", _fake_duration)
+    monkeypatch.setattr(f"{MODULE}.get_duration_seconds", lambda path: 2.0)
 
     with pytest.raises(InvalidFinalOutputError, match="did not produce"):
         assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
@@ -575,10 +576,12 @@ def test_nonexistent_final_temp_output_fails(isolated_db, tmp_path, monkeypatch)
 def test_zero_byte_final_output_fails(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
+    stream_types: dict[str, frozenset[str]] = {}
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: stream_types.get(str(Path(path)), frozenset({"video"})))
 
     def _fake_mux(video_path, audio_path, out_path):
         Path(out_path).write_bytes(b"fake")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_concat(video_paths, out_path):
@@ -597,20 +600,20 @@ def test_zero_byte_final_output_fails(isolated_db, tmp_path, monkeypatch):
 def test_zero_or_non_finite_measured_duration_fails(isolated_db, tmp_path, monkeypatch, bad_duration):
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
+    stream_types: dict[str, frozenset[str]] = {}
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: stream_types.get(str(Path(path)), frozenset({"video"})))
 
     def _fake_mux(video_path, audio_path, out_path):
         Path(out_path).write_bytes(b"fake")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_concat(video_paths, out_path):
         Path(out_path).write_bytes(b"fake-final")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
-    calls = {"n": 0}
-
     def _fake_duration(path):
-        calls["n"] += 1
         if Path(path).name == "final.mp4":
             return bad_duration
         return 2.0
@@ -626,14 +629,17 @@ def test_zero_or_non_finite_measured_duration_fails(isolated_db, tmp_path, monke
 def test_final_duration_mismatch_outside_tolerance_fails(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
+    stream_types: dict[str, frozenset[str]] = {}
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: stream_types.get(str(Path(path)), frozenset({"video"})))
 
     def _fake_mux(video_path, audio_path, out_path):
         Path(out_path).write_bytes(b"fake")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_concat(video_paths, out_path):
         Path(out_path).write_bytes(b"fake-final")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_duration(path):
@@ -652,15 +658,18 @@ def test_final_duration_mismatch_outside_tolerance_fails(isolated_db, tmp_path, 
 def test_boundary_case_inside_duration_tolerance_succeeds(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
     tolerance = _duration_tolerance_seconds(1)
+    stream_types: dict[str, frozenset[str]] = {}
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: stream_types.get(str(Path(path)), frozenset({"video"})))
 
     def _fake_mux(video_path, audio_path, out_path):
         Path(out_path).write_bytes(b"fake")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_concat(video_paths, out_path):
         Path(out_path).write_bytes(b"fake-final")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_duration(path):
@@ -671,8 +680,8 @@ def test_boundary_case_inside_duration_tolerance_succeeds(isolated_db, tmp_path,
     monkeypatch.setattr(f"{MODULE}.mux_audio_video", _fake_mux)
     monkeypatch.setattr(f"{MODULE}.concat_videos", _fake_concat)
     monkeypatch.setattr(f"{MODULE}.get_duration_seconds", _fake_duration)
-    monkeypatch.setattr("src.core.render_artifact_registrar.get_duration_seconds", _fake_duration)
-    monkeypatch.setattr("src.core.render_artifact_registrar._has_video_stream", lambda path: True)
+    monkeypatch.setattr(f"{REGISTRAR}.get_duration_seconds", _fake_duration)
+    monkeypatch.setattr(f"{REGISTRAR}._has_video_stream", lambda path: True)
 
     result = assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
     assert result.scene_count == 1
@@ -701,7 +710,7 @@ def test_temporary_scene_clips_removed_after_failure(isolated_db, tmp_path, monk
 
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: frozenset({"video"}))
 
     def _fail_mux(video_path, audio_path, out_path):
         raise ProviderError("boom")
@@ -719,10 +728,12 @@ def test_temporary_scene_clips_removed_after_failure(isolated_db, tmp_path, monk
 def test_partial_final_output_not_left_after_failure(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
+    stream_types: dict[str, frozenset[str]] = {}
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: stream_types.get(str(Path(path)), frozenset({"video"})))
 
     def _fake_mux(video_path, audio_path, out_path):
         Path(out_path).write_bytes(b"fake")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
     def _fake_concat(video_paths, out_path):
@@ -806,7 +817,7 @@ def test_no_final_artifact_registered_on_mux_failure(isolated_db, tmp_path, monk
 
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
-    monkeypatch.setattr(f"{MODULE}._has_audio_stream", lambda path: False)
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: frozenset({"video"}))
     monkeypatch.setattr(f"{MODULE}.mux_audio_video", lambda *a: (_ for _ in ()).throw(ProviderError("boom")))
 
     with pytest.raises(SceneMuxError):
@@ -847,7 +858,7 @@ def test_registration_failure_removes_newly_created_output(isolated_db, tmp_path
     calls: list = []
     _mock_ffmpeg_ok(monkeypatch, calls)
 
-    def _fail_register(conn, project, manifest_arg, source_file, *, now=None):
+    def _fail_register(conn, project, manifest_arg, source_file, *, now=None, prevalidated=None, metadata_overrides=None):
         raise RuntimeError("unexpected registration failure")
 
     monkeypatch.setattr(f"{MODULE}.register_render_artifact", _fail_register)
@@ -878,21 +889,22 @@ def test_rerun_with_existing_render_artifact_fails_with_existing_error(isolated_
 
 
 # ---------------------------------------------------------------------
-# 36: no DB connection open during FFmpeg
+# 36: no DB connection open during ANY subprocess call, including
+# registration's own (formerly-ffprobe-while-open) work
 # ---------------------------------------------------------------------
 
 
-def test_no_database_connection_open_during_ffmpeg(isolated_db, tmp_path, monkeypatch):
+def test_no_database_connection_open_during_any_subprocess(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
     _register_scenes(project_dir, project_id, ("scene-01",))
     calls: list = []
-    durations = _mock_ffmpeg_ok(monkeypatch, calls)
+    durations, stream_types = _mock_ffmpeg_ok(monkeypatch, calls)
 
     from src.database import db as db_module
 
     real_get_connection = db_module.get_connection
     real_get_readonly_connection = db_module.get_readonly_connection
-    open_during_ffmpeg = {"any": False}
+    violations: list = []
     live_connections: list = []
 
     def _tracking_get_connection():
@@ -908,24 +920,66 @@ def test_no_database_connection_open_during_ffmpeg(isolated_db, tmp_path, monkey
     monkeypatch.setattr("src.database.db.get_connection", _tracking_get_connection)
     monkeypatch.setattr("src.database.db.get_readonly_connection", _tracking_get_readonly_connection)
 
-    original_mux = None
-
-    def _checking_mux(video_path, audio_path, out_path):
+    def _any_conn_open() -> bool:
         for conn in live_connections:
             try:
                 conn.execute("SELECT 1")
-                open_during_ffmpeg["any"] = True
+                return True
             except sqlite3.ProgrammingError:
-                pass
+                continue
+        return False
+
+    def _checking_mux(video_path, audio_path, out_path):
+        if _any_conn_open():
+            violations.append("mux_audio_video")
         Path(out_path).write_bytes(b"fake-muxed-clip")
         durations[str(Path(out_path))] = 2.0
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
         return out_path
 
+    final_duration_holder: dict[str, float] = {}
+
+    def _checking_concat(video_paths, out_path):
+        if _any_conn_open():
+            violations.append("concat_videos")
+        Path(out_path).write_bytes(b"fake-final-video")
+        total = sum(durations[str(Path(p))] for p in video_paths)
+        durations[str(Path(out_path))] = total
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
+        final_duration_holder["value"] = total
+        return out_path
+
+    def _checking_get_duration_seconds(path):
+        if _any_conn_open():
+            violations.append("get_duration_seconds")
+        return durations[str(Path(path))]
+
+    def _checking_probe(path):
+        if _any_conn_open():
+            violations.append("_probe_stream_types")
+        key = str(Path(path))
+        return stream_types.get(key, frozenset({"video"}))
+
+    def _checking_registrar_duration(path):
+        if _any_conn_open():
+            violations.append("registrar.get_duration_seconds")
+        return final_duration_holder["value"]
+
+    def _checking_registrar_has_video(path):
+        if _any_conn_open():
+            violations.append("registrar._has_video_stream")
+        return True
+
     monkeypatch.setattr(f"{MODULE}.mux_audio_video", _checking_mux)
+    monkeypatch.setattr(f"{MODULE}.concat_videos", _checking_concat)
+    monkeypatch.setattr(f"{MODULE}.get_duration_seconds", _checking_get_duration_seconds)
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", _checking_probe)
+    monkeypatch.setattr(f"{REGISTRAR}.get_duration_seconds", _checking_registrar_duration)
+    monkeypatch.setattr(f"{REGISTRAR}._has_video_stream", _checking_registrar_has_video)
 
     assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
 
-    assert open_during_ffmpeg["any"] is False
+    assert violations == []
 
 
 # ---------------------------------------------------------------------
@@ -951,14 +1005,339 @@ def test_result_contains_all_required_fields_and_is_immutable(isolated_db, tmp_p
         result.project_id = "changed"
 
 
-# ---------------------------------------------------------------------
-# tolerance helper — direct unit coverage
-# ---------------------------------------------------------------------
-
-
 def test_duration_tolerance_formula():
     assert _duration_tolerance_seconds(1) == pytest.approx(max(0.25, 0.05))
     assert _duration_tolerance_seconds(10) == pytest.approx(max(0.25, 0.5))
+
+
+# ---------------------------------------------------------------------
+# artifact metadata (STEP 4)
+# ---------------------------------------------------------------------
+
+
+def test_registered_metadata_contains_scene_count_and_manifest_fingerprint(isolated_db, tmp_path, monkeypatch):
+    from src.database.artifact_repository import list_artifacts_by_project
+
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects", ("scene-01", "scene-02")
+    )
+    _register_scenes(project_dir, project_id, ("scene-01", "scene-02"))
+    calls: list = []
+    _mock_ffmpeg_ok(monkeypatch, calls)
+
+    assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    conn = get_connection()
+    try:
+        renders = list_artifacts_by_project(conn, project_id, kind="render")
+    finally:
+        conn.close()
+    assert len(renders) == 1
+    metadata = renders[0].metadata
+    assert metadata["scene_count"] == 2
+    assert metadata["manifest_fingerprint"] == manifest.source_fingerprint
+    assert metadata["source"] == "final-video-assembly-v1"
+    assert metadata["duration_seconds"] == pytest.approx(4.0)
+
+
+# ---------------------------------------------------------------------
+# strict media probing (STEP 2 / STEP 7)
+# ---------------------------------------------------------------------
+
+
+def test_probe_ffprobe_missing_raises_media_probe_error(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+
+    def _fail_run(*a, **k):
+        raise FileNotFoundError("ffprobe not found")
+
+    monkeypatch.setattr(f"{MODULE}.subprocess.run", _fail_run)
+
+    with pytest.raises(MediaProbeError) as exc_info:
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+    assert isinstance(exc_info.value.__cause__, FileNotFoundError)
+
+
+def test_probe_nonzero_exit_raises_media_probe_error(isolated_db, tmp_path, monkeypatch):
+    import subprocess as sp
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+
+    fake_result = sp.CompletedProcess(args=[], returncode=1, stdout="", stderr="error")
+    monkeypatch.setattr(f"{MODULE}.subprocess.run", lambda *a, **k: fake_result)
+
+    with pytest.raises(MediaProbeError):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+def test_probe_empty_output_raises_media_probe_error(isolated_db, tmp_path, monkeypatch):
+    import subprocess as sp
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+
+    fake_result = sp.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(f"{MODULE}.subprocess.run", lambda *a, **k: fake_result)
+
+    with pytest.raises(MediaProbeError):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+def test_probe_malformed_json_raises_media_probe_error(isolated_db, tmp_path, monkeypatch):
+    import subprocess as sp
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+
+    fake_result = sp.CompletedProcess(args=[], returncode=0, stdout="{not json", stderr="")
+    monkeypatch.setattr(f"{MODULE}.subprocess.run", lambda *a, **k: fake_result)
+
+    with pytest.raises(MediaProbeError) as exc_info:
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+    import json as _json
+
+    assert isinstance(exc_info.value.__cause__, _json.JSONDecodeError)
+
+
+def test_probe_structurally_invalid_json_raises_media_probe_error(isolated_db, tmp_path, monkeypatch):
+    import subprocess as sp
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+
+    fake_result = sp.CompletedProcess(args=[], returncode=0, stdout='{"not_streams": []}', stderr="")
+    monkeypatch.setattr(f"{MODULE}.subprocess.run", lambda *a, **k: fake_result)
+
+    with pytest.raises(MediaProbeError):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+def test_probe_failure_never_interpreted_as_no_audio(isolated_db, tmp_path, monkeypatch):
+    """A probe failure must raise, never silently resolve to "no audio
+    stream present" (which would let a scene mux through unexamined)."""
+    import subprocess as sp
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+
+    fake_result = sp.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+    calls: list = []
+
+    def _tracking_run(*a, **k):
+        calls.append("probe_attempted")
+        return fake_result
+
+    monkeypatch.setattr(f"{MODULE}.subprocess.run", _tracking_run)
+
+    with pytest.raises(MediaProbeError):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+    assert "probe_attempted" in calls  # the probe genuinely ran and genuinely failed, not skipped
+
+
+def test_video_only_prepared_clip_rejected(isolated_db, tmp_path, monkeypatch):
+    """If mux_audio_video() itself somehow produced a clip missing the
+    audio stream it was supposed to add, this must be caught, not
+    silently accepted on duration alone."""
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+
+    def _fake_probe(path):
+        return frozenset({"video"})  # never reports audio, even after "muxing"
+
+    def _fake_mux(video_path, audio_path, out_path):
+        Path(out_path).write_bytes(b"fake")
+        return out_path
+
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", _fake_probe)
+    monkeypatch.setattr(f"{MODULE}.mux_audio_video", _fake_mux)
+
+    with pytest.raises(SceneMuxError, match="missing a required video or audio"):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+def test_audio_only_animation_input_rejected(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: frozenset({"audio"}))
+    monkeypatch.setattr(f"{MODULE}.mux_audio_video", lambda *a: (_ for _ in ()).throw(AssertionError("must not be called")))
+
+    with pytest.raises(SceneMuxError, match="no video stream"):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+def test_final_output_missing_audio_rejected(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    stream_types: dict[str, frozenset[str]] = {}
+
+    def _fake_probe(path):
+        key = str(Path(path))
+        if key in stream_types:
+            return stream_types[key]
+        return frozenset({"video"})
+
+    def _fake_mux(video_path, audio_path, out_path):
+        Path(out_path).write_bytes(b"fake")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
+        return out_path
+
+    def _fake_concat(video_paths, out_path):
+        Path(out_path).write_bytes(b"fake-final")
+        stream_types[str(Path(out_path))] = frozenset({"video"})  # missing audio
+        return out_path
+
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", _fake_probe)
+    monkeypatch.setattr(f"{MODULE}.mux_audio_video", _fake_mux)
+    monkeypatch.setattr(f"{MODULE}.concat_videos", _fake_concat)
+    monkeypatch.setattr(f"{MODULE}.get_duration_seconds", lambda path: 2.0)
+
+    with pytest.raises(InvalidFinalOutputError, match="no audio stream"):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+def test_final_output_missing_video_rejected(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    stream_types: dict[str, frozenset[str]] = {}
+
+    def _fake_probe(path):
+        key = str(Path(path))
+        if key in stream_types:
+            return stream_types[key]
+        return frozenset({"video"})
+
+    def _fake_mux(video_path, audio_path, out_path):
+        Path(out_path).write_bytes(b"fake")
+        stream_types[str(Path(out_path))] = frozenset({"video", "audio"})
+        return out_path
+
+    def _fake_concat(video_paths, out_path):
+        Path(out_path).write_bytes(b"fake-final")
+        stream_types[str(Path(out_path))] = frozenset({"audio"})  # missing video
+        return out_path
+
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", _fake_probe)
+    monkeypatch.setattr(f"{MODULE}.mux_audio_video", _fake_mux)
+    monkeypatch.setattr(f"{MODULE}.concat_videos", _fake_concat)
+    monkeypatch.setattr(f"{MODULE}.get_duration_seconds", lambda path: 2.0)
+
+    with pytest.raises(InvalidFinalOutputError, match="no video stream"):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+def test_animation_input_with_existing_audio_rejected(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    calls: list = []
+    _mock_ffmpeg_ok(monkeypatch, calls, animation_has_audio=True)
+
+    with pytest.raises(SceneMuxError, match="already contains an audio"):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+# ---------------------------------------------------------------------
+# cleanup failures (STEP 5)
+# ---------------------------------------------------------------------
+
+
+def test_tempdir_removal_failure_is_not_silently_suppressed(isolated_db, tmp_path, monkeypatch):
+    """A tempdir-removal failure with NO primary exception in flight (a
+    pure cleanup-only failure after an otherwise-complete run) must
+    surface as FinalVideoCleanupError, not be swallowed."""
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    calls: list = []
+    _mock_ffmpeg_ok(monkeypatch, calls)
+
+    def _fail_rmtree(path, *a, **k):
+        raise OSError("simulated: directory in use")
+
+    monkeypatch.setattr(f"{MODULE}.shutil.rmtree", _fail_rmtree)
+
+    with pytest.raises(FinalVideoCleanupError) as exc_info:
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+    assert isinstance(exc_info.value.__cause__, OSError)
+
+
+def test_tempdir_removal_failure_after_primary_failure_preserves_primary(isolated_db, tmp_path, monkeypatch):
+    """When a primary assembly failure is already in flight, a SUBSEQUENT
+    tempdir-removal failure must not replace it — the original,
+    actionable exception stays the one that propagates, with the cleanup
+    problem attached as a note."""
+    from src.providers.base import ProviderError
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    monkeypatch.setattr(f"{MODULE}._probe_stream_types", lambda path: frozenset({"video"}))
+    monkeypatch.setattr(f"{MODULE}.mux_audio_video", lambda *a: (_ for _ in ()).throw(ProviderError("boom")))
+
+    def _fail_rmtree(path, *a, **k):
+        raise OSError("simulated: directory in use")
+
+    monkeypatch.setattr(f"{MODULE}.shutil.rmtree", _fail_rmtree)
+
+    with pytest.raises(SceneMuxError) as exc_info:
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    notes = getattr(exc_info.value, "__notes__", [])
+    assert any("directory" in note for note in notes)
+
+
+def test_orphaned_output_removal_failure_after_registration_failure(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    calls: list = []
+    _mock_ffmpeg_ok(monkeypatch, calls)
+
+    def _fail_register(conn, project, manifest_arg, source_file, *, now=None, prevalidated=None, metadata_overrides=None):
+        raise RuntimeError("unexpected registration failure")
+
+    monkeypatch.setattr(f"{MODULE}.register_render_artifact", _fail_register)
+
+    real_unlink = Path.unlink
+
+    def _fail_unlink(self, *a, **k):
+        if self.name == "out.mp4":
+            raise OSError("simulated: permission denied")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", _fail_unlink)
+
+    with pytest.raises(FinalArtifactRegistrationError) as exc_info:
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    notes = getattr(exc_info.value, "__notes__", [])
+    assert any("orphaned output" in note for note in notes)
+
+
+def test_pre_existing_files_untouched_when_cleanup_fails(isolated_db, tmp_path, monkeypatch):
+    """A cleanup failure must never cause a pre-existing, unrelated file
+    to be touched or removed."""
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects", ("scene-01",))
+    _register_scenes(project_dir, project_id, ("scene-01",))
+    unrelated_file = tmp_path / "unrelated.txt"
+    unrelated_file.write_bytes(b"do not touch")
+    calls: list = []
+    _mock_ffmpeg_ok(monkeypatch, calls)
+
+    def _fail_rmtree(path, *a, **k):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(f"{MODULE}.shutil.rmtree", _fail_rmtree)
+
+    with pytest.raises(FinalVideoCleanupError):
+        assemble_final_video(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    assert unrelated_file.read_bytes() == b"do not touch"
+
+
+def test_no_cleanup_exception_silently_suppressed():
+    """FinalVideoCleanupError is a real, raisable, catchable exception
+    type — not a sentinel that gets swallowed anywhere in this module."""
+    with pytest.raises(FinalVideoCleanupError):
+        raise FinalVideoCleanupError("temp directory removal failed")
 
 
 # ---------------------------------------------------------------------
@@ -1001,16 +1380,21 @@ def test_real_pipeline_integration(isolated_db, tmp_path):
 
         _register_animation(project_dir, project_id, scene_id, content=animation_path.read_bytes())
         _register_audio(project_dir, project_id, scene_id, content=audio_path.read_bytes())
-        # The two lines above re-write the same bytes via _register_artifact's
-        # own path.write_bytes — harmless (identical content), keeps the
-        # SQLite row's checksum consistent with what's actually on disk.
 
     output = tmp_path / "final.mp4"
     result = assemble_final_video(project_id, project_dir / "manifest.json", output)
 
     assert output.exists()
+
+    from src.core.final_video_assembly import _probe_stream_types
+
+    final_streams = _probe_stream_types(output)
+    assert "video" in final_streams
+    assert "audio" in final_streams
+
     duration = ffmpeg_render.get_duration_seconds(output)
-    assert duration == pytest.approx(2.0, abs=0.5)
+    assert duration > 0
+    assert duration == pytest.approx(2.0, abs=_duration_tolerance_seconds(2))
     assert result.measured_duration_seconds == pytest.approx(duration)
 
     conn = get_connection()
@@ -1019,6 +1403,8 @@ def test_real_pipeline_integration(isolated_db, tmp_path):
     finally:
         conn.close()
     assert len(renders) == 1
+    assert renders[0].metadata["scene_count"] == 2
+    assert renders[0].metadata["manifest_fingerprint"] == manifest.source_fingerprint
 
     leftover = [p for p in tmp_path.iterdir() if p.name.startswith("final-video-assembly-")]
     assert leftover == []

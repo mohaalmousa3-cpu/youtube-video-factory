@@ -1941,7 +1941,22 @@ def cmd_assemble_final_video(args: argparse.Namespace) -> int:
     departure from every other command's "CLI owns all SQLite access"
     shape, required by this command's three-part lifecycle; see that
     module's own docstring for why. This command function therefore opens
-    no connection of its own."""
+    no connection of its own.
+
+    JSON-mode failures are printed to stderr here, unlike this codebase's
+    other 20+ commands (whose own `_fail()` closures print JSON — success
+    or failure alike — to stdout). That is a deliberate, narrow exception
+    for this one command, not a silent inconsistency: this command's own
+    review explicitly required errors to go to stderr in both output
+    modes. The other commands' existing stdout-for-all-JSON behavior is
+    untouched.
+
+    An undocumented/unexpected exception (not a FinalVideoAssemblyError
+    subclass) is caught at this boundary and reported as one short,
+    generic, sanitized message — never the original exception's own text,
+    traceback, or any environment/provider credential.
+    KeyboardInterrupt/SystemExit are BaseException, not Exception, so
+    neither is ever caught here."""
     from src.core.final_video_assembly import FinalVideoAssemblyError, assemble_final_video
 
     out_format = args.format
@@ -1955,7 +1970,7 @@ def cmd_assemble_final_video(args: argparse.Namespace) -> int:
     def _fail(reason: str) -> int:
         if out_format == "json":
             payload = {"ok": False, "project_id": args.project_id, "reason": reason}
-            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True), file=sys.stderr)
         else:
             print(f"assemble-final-video: FAILED — {reason}", file=sys.stderr)
         return 1
@@ -1964,6 +1979,8 @@ def cmd_assemble_final_video(args: argparse.Namespace) -> int:
         result = assemble_final_video(args.project_id, Path(args.manifest), Path(args.output))
     except FinalVideoAssemblyError as exc:
         return _fail(str(exc))
+    except Exception:
+        return _fail("an unexpected internal error occurred")
 
     if out_format == "json":
         payload = {

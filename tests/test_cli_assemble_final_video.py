@@ -273,13 +273,11 @@ def test_cli_domain_failure_returns_nonzero(isolated_db, tmp_path, capsys, monke
     assert rc != 0
 
 
-def test_cli_unexpected_failure_does_not_expose_secrets(isolated_db, tmp_path, capsys, monkeypatch):
-    """An UNDOCUMENTED exception type (not FinalVideoAssemblyError) is not
-    caught by this command's own try/except — it propagates unchanged,
-    matching this codebase's established "an undocumented failure is a
-    bug to surface, not an outcome to sanitize" convention. This test
-    proves the command's OWN error-formatting path never echoes secret-
-    looking content when it does construct a failure message."""
+def test_cli_domain_failure_message_does_not_expose_secrets(isolated_db, tmp_path, capsys, monkeypatch):
+    """A FinalVideoAssemblyError's own message text is always a short,
+    sanitized, fixed-shape string this codebase's domain modules
+    construct themselves — this proves the CLI's own error-formatting
+    path never echoes secret-looking content when printing one."""
     from src.core.final_video_assembly import FinalVideoAssemblyError
 
     sentinel = "SENTINEL-NOT-A-SECRET-9f2a"
@@ -300,6 +298,107 @@ def test_cli_unexpected_failure_does_not_expose_secrets(isolated_db, tmp_path, c
     assert "QWEN_API_KEY" not in err
     assert "GROQ_API_KEY" not in err
     assert sentinel in err
+
+
+def test_cli_unexpected_exception_returns_nonzero_without_exposing_message(isolated_db, tmp_path, capsys, monkeypatch):
+    """A genuinely UNEXPECTED exception (not a FinalVideoAssemblyError
+    subclass — e.g. an internal bug, a raw OSError) is caught at this
+    command's own boundary and reported as one short, generic, sanitized
+    message. The exception's own original text (which could carry a raw
+    path, an internal detail, or worse) is never printed."""
+    secret_like = "SENTINEL-ORIGINAL-MESSAGE-never-printed-c3d9/etc/shadow"
+
+    def _fail(project_id, manifest_path, output_path):
+        raise RuntimeError(secret_like)
+
+    monkeypatch.setattr(f"{GENERATION_MODULE}.assemble_final_video", _fail)
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects")
+    manifest_path = project_dir / "manifest.json"
+    output_path = tmp_path / "final.mp4"
+
+    rc = cli.cmd_assemble_final_video(_args(project_id, manifest_path, output_path))
+    out, err = capsys.readouterr()
+
+    assert rc != 0
+    assert secret_like not in err
+    assert secret_like not in out
+    assert "unexpected internal error" in err
+
+
+def test_cli_keyboard_interrupt_is_not_caught(isolated_db, tmp_path, monkeypatch):
+    """KeyboardInterrupt/SystemExit are BaseException, not Exception —
+    this command's `except Exception` must never intercept them."""
+
+    def _fail(project_id, manifest_path, output_path):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(f"{GENERATION_MODULE}.assemble_final_video", _fail)
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects")
+    manifest_path = project_dir / "manifest.json"
+    output_path = tmp_path / "final.mp4"
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_assemble_final_video(_args(project_id, manifest_path, output_path))
+
+
+def test_cli_json_domain_error_written_only_to_stderr(isolated_db, tmp_path, capsys, monkeypatch):
+    from src.core.final_video_assembly import ProjectNotFoundError
+
+    def _fail(project_id, manifest_path, output_path):
+        raise ProjectNotFoundError(f"unknown project_id {project_id!r}")
+
+    monkeypatch.setattr(f"{GENERATION_MODULE}.assemble_final_video", _fail)
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects")
+    manifest_path = project_dir / "manifest.json"
+    output_path = tmp_path / "final.mp4"
+
+    rc = cli.cmd_assemble_final_video(_args(project_id, manifest_path, output_path, out_format="json"))
+    out, err = capsys.readouterr()
+
+    assert rc != 0
+    assert out == ""
+    payload = json.loads(err)
+    assert payload["ok"] is False
+    assert payload["project_id"] == project_id
+
+
+def test_cli_text_domain_error_written_only_to_stderr(isolated_db, tmp_path, capsys, monkeypatch):
+    from src.core.final_video_assembly import ProjectNotFoundError
+
+    def _fail(project_id, manifest_path, output_path):
+        raise ProjectNotFoundError(f"unknown project_id {project_id!r}")
+
+    monkeypatch.setattr(f"{GENERATION_MODULE}.assemble_final_video", _fail)
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects")
+    manifest_path = project_dir / "manifest.json"
+    output_path = tmp_path / "final.mp4"
+
+    rc = cli.cmd_assemble_final_video(_args(project_id, manifest_path, output_path, out_format="text"))
+    out, err = capsys.readouterr()
+
+    assert rc != 0
+    assert out == ""
+    assert "assemble-final-video: FAILED" in err
+
+
+def test_cli_successful_json_written_only_to_stdout(isolated_db, tmp_path, capsys, monkeypatch):
+    _mock_pipeline_success(monkeypatch)
+
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects")
+    manifest_path = project_dir / "manifest.json"
+    output_path = tmp_path / "final.mp4"
+
+    rc = cli.cmd_assemble_final_video(_args(project_id, manifest_path, output_path, out_format="json"))
+    out, err = capsys.readouterr()
+
+    assert rc == 0
+    assert err == ""
+    payload = json.loads(out)
+    assert payload["ok"] is True
 
 
 def test_cli_invalid_format_rejects(isolated_db, tmp_path, capsys):

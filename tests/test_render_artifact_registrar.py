@@ -17,7 +17,11 @@ from src.core.manifest_builder import build_video_manifest
 from src.core.manifest_store import save_manifest
 from src.core.project_state_machine import create_initial_project, initial_transition_for
 from src.core.render_artifact_registrar import (
+    PrevalidatedRenderSource,
     RenderArtifactRegistrationError,
+    RenderSourceMismatchError,
+    RenderSourceValidationError,
+    prevalidate_render_source,
     register_render_artifact,
 )
 from src.core.verified_transition_service import verify_and_advance
@@ -562,3 +566,157 @@ def test_no_render_artifact_prevents_rendered(conn, tmp_path):
 
     final = get_project(conn, project.project_id)
     assert final.current_stage == "render_pending"  # never advanced
+
+
+# ---------------------------------------------------------------------
+# prevalidate_render_source() — pure, local, no SQLite connection
+# ---------------------------------------------------------------------
+
+
+def test_prevalidate_render_source_succeeds_on_real_video(tmp_path):
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0)
+
+    result = prevalidate_render_source(source)
+
+    assert isinstance(result, PrevalidatedRenderSource)
+    assert result.source_path == source.resolve()
+    assert result.byte_size == source.stat().st_size
+    assert result.sha256_checksum == _sha256(source)
+    assert result.duration_seconds == pytest.approx(1.0, abs=0.2)
+
+
+def test_prevalidate_render_source_missing_file_fails(tmp_path):
+    with pytest.raises(RenderSourceValidationError, match="does not exist"):
+        prevalidate_render_source(tmp_path / "does-not-exist.mp4")
+
+
+def test_prevalidate_render_source_empty_file_fails(tmp_path):
+    source = tmp_path / "empty.mp4"
+    source.write_bytes(b"")
+
+    with pytest.raises(RenderSourceValidationError, match="empty"):
+        prevalidate_render_source(source)
+
+
+def test_prevalidate_render_source_audio_only_fails(tmp_path):
+    source = tmp_path / "audio_only.mp4"
+    _real_audio_only_mp4(source, duration_seconds=1.0)
+
+    with pytest.raises(RenderSourceValidationError, match="video stream"):
+        prevalidate_render_source(source)
+
+
+# ---------------------------------------------------------------------
+# register_render_artifact(..., prevalidated=...) — no ffprobe re-run
+# ---------------------------------------------------------------------
+
+
+def test_register_with_prevalidated_result_succeeds_without_reprobing(conn, tmp_path, monkeypatch):
+    project, manifest, project_dir = _registered_project(conn, tmp_path)
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0)
+
+    prevalidated = prevalidate_render_source(source)
+
+    def _boom(*a, **k):
+        raise AssertionError("must not re-run ffprobe when prevalidated is supplied")
+
+    monkeypatch.setattr("src.core.render_artifact_registrar.get_duration_seconds", _boom)
+    monkeypatch.setattr("src.core.render_artifact_registrar._has_video_stream", _boom)
+
+    result = register_render_artifact(conn, project, manifest, source, now=FIXED_NOW, prevalidated=prevalidated)
+
+    assert result.ok is True
+    assert result.duration_seconds == pytest.approx(prevalidated.duration_seconds)
+    stored = list_artifacts_by_project(conn, project.project_id, kind="render")
+    assert len(stored) == 1
+
+
+def test_register_with_stale_prevalidated_checksum_mismatch_raises(conn, tmp_path):
+    project, manifest, project_dir = _registered_project(conn, tmp_path)
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0, color="red")
+
+    prevalidated = prevalidate_render_source(source)
+
+    # Replace the file's content after prevalidation ran -- a stale result.
+    _real_mp4(source, duration_seconds=1.0, color="blue")
+
+    with pytest.raises(RenderSourceMismatchError, match="no longer matches"):
+        register_render_artifact(conn, project, manifest, source, now=FIXED_NOW, prevalidated=prevalidated)
+
+    # No partial registration from the rejected attempt.
+    stored = list_artifacts_by_project(conn, project.project_id, kind="render")
+    assert stored == []
+
+
+def test_register_with_stale_prevalidated_size_mismatch_raises(conn, tmp_path):
+    project, manifest, project_dir = _registered_project(conn, tmp_path)
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0)
+
+    prevalidated = prevalidate_render_source(source)
+    # Append bytes after prevalidation -- content AND size both change,
+    # but this specifically proves the size check alone would catch it.
+    with source.open("ab") as f:
+        f.write(b"\x00" * 100)
+
+    with pytest.raises(RenderSourceMismatchError):
+        register_render_artifact(conn, project, manifest, source, now=FIXED_NOW, prevalidated=prevalidated)
+
+
+def test_register_without_prevalidated_keeps_existing_behavior(conn, tmp_path):
+    """Every existing caller that omits `prevalidated` (the default,
+    None) gets exactly the same full-ffprobe-validation behavior as
+    before this parameter existed."""
+    project, manifest, project_dir = _registered_project(conn, tmp_path)
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0)
+
+    result = register_render_artifact(conn, project, manifest, source, now=FIXED_NOW)
+
+    assert result.ok is True
+    assert result.duration_seconds == pytest.approx(1.0, abs=0.2)
+
+
+# ---------------------------------------------------------------------
+# register_render_artifact(..., metadata_overrides=...)
+# ---------------------------------------------------------------------
+
+
+def test_metadata_overrides_merge_into_default_metadata(conn, tmp_path):
+    project, manifest, project_dir = _registered_project(conn, tmp_path)
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0)
+
+    result = register_render_artifact(
+        conn,
+        project,
+        manifest,
+        source,
+        now=FIXED_NOW,
+        metadata_overrides={"source": "final-video-assembly-v1", "scene_count": 3, "manifest_fingerprint": "abc123"},
+    )
+
+    assert result.ok is True
+    stored = list_artifacts_by_project(conn, project.project_id, kind="render")[0]
+    assert stored.metadata["source"] == "final-video-assembly-v1"
+    assert stored.metadata["scene_count"] == 3
+    assert stored.metadata["manifest_fingerprint"] == "abc123"
+    assert stored.metadata["duration_seconds"] == pytest.approx(1.0, abs=0.2)
+
+
+def test_no_metadata_overrides_keeps_default_metadata(conn, tmp_path):
+    """Every existing caller that omits `metadata_overrides` gets exactly
+    the same default {"duration_seconds": ..., "source": "external"}
+    metadata shape as before this parameter existed."""
+    project, manifest, project_dir = _registered_project(conn, tmp_path)
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0)
+
+    register_render_artifact(conn, project, manifest, source, now=FIXED_NOW)
+
+    stored = list_artifacts_by_project(conn, project.project_id, kind="render")[0]
+    assert stored.metadata["source"] == "external"
+    assert set(stored.metadata.keys()) == {"duration_seconds", "source"}
