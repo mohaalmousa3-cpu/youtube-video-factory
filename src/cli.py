@@ -2073,6 +2073,163 @@ def cmd_render_text_overlays(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_derive_text_overlays(args: argparse.Namespace) -> int:
+    """DETERMINISTIC OVERLAY DERIVATION V1: local-only, pure manifest
+    enrichment. Reads --manifest (an already finalize-scene-timing'd copy,
+    every scene's artifacts.measured_audio_duration_seconds populated) and
+    the project's single registered project-level "render" artifact, then
+    writes a NEW manifest to --output in which every scene with no
+    explicit text_overlays receives exactly one deterministically-derived
+    TextOverlay — preparing input for the already-merged
+    `render-text-overlays` command. No FFmpeg/ffprobe/provider/network
+    call anywhere in this command path; no database write; no artifact
+    registration; no project/lifecycle-stage change.
+
+    DB access shape follows cmd_finalize_scene_timing exactly: one
+    short-lived get_readonly_connection(), used only to fetch the project
+    record and resolve exactly one project-level "render" artifact,
+    closed via the `finally` block BEFORE src.core.overlay_derivation.
+    derive_text_overlays() (a pure function, no I/O of its own) is ever
+    called.
+
+    stdout/stderr shape follows cmd_render_text_overlays exactly: success
+    (text or JSON) goes to stdout; a domain error (text or JSON) goes to
+    stderr — this command's own narrow exception to this codebase's other
+    20+ commands' stdout-for-all-JSON convention, chosen for consistency
+    with the other already-merged TEXT OVERLAY RENDERER V1 command rather
+    than cmd_finalize_scene_timing's own (JSON-less, stderr-only) shape.
+
+    An undocumented/unexpected exception (not an OverlayDerivationError
+    subclass, nor a ManifestStoreError, nor a project/argument validation
+    failure raised directly here) is caught at this boundary and reported
+    as one short, generic, sanitized message — never the original
+    exception's own text, traceback, or any environment/provider
+    credential. KeyboardInterrupt/SystemExit are BaseException, not
+    Exception, so neither is ever caught here."""
+    from src.core.manifest_store import ManifestStoreError, load_manifest, save_manifest
+    from src.core.overlay_derivation import OverlayDerivationError, derive_text_overlays, summarize_derivation
+    from src.database.artifact_repository import list_artifacts_by_project
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"derive-text-overlays: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {"ok": False, "project_id": args.project_id, "reason": reason}
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True), file=sys.stderr)
+        else:
+            print(f"derive-text-overlays: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        try:
+            conn = get_readonly_connection()
+        except sqlite3.Error as exc:
+            return _fail(f"no local project database found: {exc}")
+
+        try:
+            project = get_project(conn, args.project_id)
+            if project is None:
+                return _fail(f"no project found with project_id {args.project_id!r}")
+
+            render_artifacts = list_artifacts_by_project(conn, args.project_id, kind="render")
+        finally:
+            conn.close()
+
+        if len(render_artifacts) == 0:
+            return _fail(f"no 'render' artifact is registered for project {args.project_id!r}")
+        if len(render_artifacts) > 1:
+            return _fail(
+                f"project {args.project_id!r} has {len(render_artifacts)} 'render' artifacts "
+                "(expected exactly 1)"
+            )
+        render_artifact = render_artifacts[0]
+
+        # --output must be a separate, explicit destination — never the
+        # project's own canonical manifest path, and never the same file
+        # as --manifest itself. Same Path.resolve()/os.path.normcase()
+        # convention cmd_finalize_scene_timing already uses.
+        output_path_resolved = Path(args.output).resolve()
+        output_resolved = os.path.normcase(str(output_path_resolved))
+        manifest_path_resolved = os.path.normcase(str(Path(args.manifest).resolve()))
+        canonical_manifest_resolved = os.path.normcase(str(Path(project.manifest_path).resolve()))
+        if output_resolved == canonical_manifest_resolved:
+            return _fail(
+                "--output must not be the project's own canonical manifest path; choose a "
+                "separate destination for the derived copy"
+            )
+        if output_resolved == manifest_path_resolved:
+            return _fail("--output must not be the same path as --manifest")
+        if output_path_resolved.exists():
+            return _fail("--output already exists")
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError as exc:
+            return _fail(str(exc))
+
+        if manifest.project_id != args.project_id:
+            return _fail(
+                f"--manifest project_id {manifest.project_id!r} does not match project_id "
+                f"{args.project_id!r}"
+            )
+        if manifest.source_fingerprint != project.manifest_fingerprint:
+            return _fail(
+                "--manifest source_fingerprint does not match the project registry's recorded "
+                "fingerprint"
+            )
+
+        try:
+            enriched = derive_text_overlays(manifest, render_artifact)
+        except OverlayDerivationError as exc:
+            return _fail(str(exc))
+
+        summary = summarize_derivation(manifest, enriched)
+
+        try:
+            save_manifest(enriched, Path(args.output))
+        except ManifestStoreError as exc:
+            return _fail(str(exc))
+    except Exception:
+        return _fail("an unexpected internal error occurred")
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": enriched.project_id,
+            "input_manifest": str(args.manifest),
+            "output_manifest": str(args.output),
+            "scenes_with_new_overlays": summary.scenes_with_new_overlays,
+            "scenes_with_existing_overlays": summary.scenes_with_existing_overlays,
+            "derived_overlay_count": summary.derived_overlay_count,
+            "preserved_overlay_count": summary.preserved_overlay_count,
+            "source_render_artifact_id": render_artifact.artifact_id,
+            "source_render_duration_seconds": render_artifact.metadata["duration_seconds"],
+            "source_fingerprint": enriched.source_fingerprint,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("derive-text-overlays: OK (derived overlays written to a new manifest copy)")
+        print(f"  project_id: {enriched.project_id}")
+        print(f"  input_manifest: {args.manifest}")
+        print(f"  output_manifest: {args.output}")
+        print(f"  scenes_with_new_overlays: {summary.scenes_with_new_overlays}")
+        print(f"  scenes_with_existing_overlays: {summary.scenes_with_existing_overlays}")
+        print(f"  derived_overlay_count: {summary.derived_overlay_count}")
+        print(f"  preserved_overlay_count: {summary.preserved_overlay_count}")
+        print(f"  source_render_artifact_id: {render_artifact.artifact_id}")
+        print(f"  source_render_duration_seconds: {render_artifact.metadata['duration_seconds']}")
+        print(f"  source_fingerprint: {enriched.source_fingerprint}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -2451,6 +2608,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     render_text_overlays.set_defaults(func=cmd_render_text_overlays)
+
+    derive_text_overlays = sub.add_parser(
+        "derive-text-overlays",
+        help="Local-only: write a new manifest copy in which every scene with no explicit "
+        "text_overlays receives exactly one deterministically-derived TextOverlay (narration "
+        "prefix + cumulative measured timing); requires finalize-scene-timing and an "
+        "already-registered render artifact; no provider, no FFmpeg, no network call",
+    )
+    derive_text_overlays.add_argument("project_id")
+    derive_text_overlays.add_argument(
+        "--manifest", required=True, help="Path to the finalize-scene-timing'd VideoManifest JSON"
+    )
+    derive_text_overlays.add_argument(
+        "--output", required=True, help="Path to save the derived VideoManifest JSON; must not already exist"
+    )
+    derive_text_overlays.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    derive_text_overlays.set_defaults(func=cmd_derive_text_overlays)
 
     return parser
 
