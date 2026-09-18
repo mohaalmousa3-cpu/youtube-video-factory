@@ -2649,6 +2649,122 @@ def cmd_verify_final_output(args: argparse.Namespace) -> int:
     return 0 if report.passed else 1
 
 
+def cmd_run_final_qc_workflow(args: argparse.Namespace) -> int:
+    """QC WORKFLOW WRAPPER V1: local-only coordination of
+    verify-final-output -> register-qc-report-artifact -> verify-and-advance
+    (to qc_passed) for one project, resume-safe (never regenerates a
+    report when a valid, already-registered, passed=true qc_report
+    artifact already exists) and never auto-registering a passed=false
+    report. No provider, no network call, no direct call to FFmpeg/ffprobe
+    or any other external process, no artifact-verifier import, and no
+    lifecycle move beyond qc_passed anywhere in this command path.
+
+    All SQLite access lives inside
+    src.core.qc_workflow.run_qc_workflow() itself (short-lived read-only
+    and write connections, never held open across a stage call) — this
+    command function opens no connection of its own, same shape as
+    cmd_build_final_local.
+
+    Success (exit code 0) means full completion only: the QC report says
+    passed=true, its qc_report artifact is registered, and the project's
+    lifecycle stage reached qc_passed. Any blocked or partial result still
+    prints the full QcWorkflowResult (ok: false) to stdout and returns a
+    non-zero exit code — partial progress (a report already written, an
+    artifact already registered) is real state the caller needs to see,
+    never treated as an exception. An up-front QcWorkflowError (invalid
+    input, an unsafe --report-output, a project/manifest mismatch, or an
+    impossible artifact topology, all detected before anything was
+    written) or a FinalQcProbeError (QC unable to determine reality at
+    all) is instead reported to stderr, text or JSON, with no result
+    payload and no report file.
+
+    An undocumented/unexpected exception is caught at this boundary and
+    reported as one short, generic, sanitized message — never the original
+    exception's own text, traceback, or any environment/provider
+    credential. KeyboardInterrupt/SystemExit are BaseException, not
+    Exception, so neither is ever caught here."""
+    from src.core.final_qc_gate import FinalQcProbeError
+    from src.core.qc_workflow import QcWorkflowError, run_qc_workflow
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"run-final-qc-workflow: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    require_overlays = args.require_overlays == "true"
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {"ok": False, "project_id": args.project_id, "reason": reason}
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True), file=sys.stderr)
+        else:
+            print(f"run-final-qc-workflow: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        result = run_qc_workflow(
+            project_id=args.project_id,
+            manifest_path=Path(args.manifest),
+            report_output_path=Path(args.report_output),
+            require_overlays=require_overlays,
+            reason=args.reason,
+        )
+    except (QcWorkflowError, FinalQcProbeError) as exc:
+        return _fail(str(exc))
+    except Exception:
+        return _fail("an unexpected internal error occurred")
+
+    ok = (
+        result.qc_report_passed is True
+        and result.qc_report_artifact_registered is True
+        and result.lifecycle_advanced is True
+        and result.resulting_project_stage == "qc_passed"
+    )
+    payload = {
+        "ok": ok,
+        "project_id": result.project_id,
+        "qc_report_generated": result.qc_report_generated,
+        "qc_report_passed": result.qc_report_passed,
+        "qc_report_path": result.qc_report_path,
+        "qc_report_artifact_registered": result.qc_report_artifact_registered,
+        "qc_report_artifact_id": result.qc_report_artifact_id,
+        "lifecycle_advanced": result.lifecycle_advanced,
+        "resulting_project_stage": result.resulting_project_stage,
+        "stopped_at_step": result.stopped_at_step,
+        "blocked_reasons": list(result.blocked_reasons),
+        "warnings": list(result.warnings),
+        "verification_report_summary": result.verification_report_summary,
+    }
+    if out_format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(f"run-final-qc-workflow: {'OK' if ok else 'PARTIAL'} (ok={ok})")
+        for key, value in payload.items():
+            if key in ("ok", "blocked_reasons", "warnings", "verification_report_summary"):
+                continue
+            print(f"  {key}: {value}")
+        summary = result.verification_report_summary
+        if summary is None:
+            print("  verification_report_summary: None")
+        else:
+            print(
+                "  verification_report_summary: "
+                f"passed={summary.get('passed')} "
+                f"overlay_render_present={summary.get('overlay_render_present')} "
+                f"viewer_facing_output_kind={summary.get('viewer_facing_output_kind')}"
+            )
+        print("  blocked_reasons:")
+        for reason in result.blocked_reasons:
+            print(f"    - {reason}")
+        print("  warnings:")
+        for warning in result.warnings:
+            print(f"    - {warning}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -3112,6 +3228,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     verify_final_output.set_defaults(func=cmd_verify_final_output)
+
+    run_final_qc_workflow = sub.add_parser(
+        "run-final-qc-workflow",
+        help="Local-only: run verify-final-output, register a passed report as the project's qc_report "
+        "artifact, and advance the project to qc_passed via verify-and-advance; resume-safe, never "
+        "registers a passed=false report, never overwrites anything; no provider, no network call",
+    )
+    run_final_qc_workflow.add_argument("project_id")
+    run_final_qc_workflow.add_argument(
+        "--manifest", required=True, help="Path to the VideoManifest JSON actually used to render the output"
+    )
+    run_final_qc_workflow.add_argument(
+        "--report-output", required=True, help="Path to write the QC report JSON; must not already exist"
+    )
+    run_final_qc_workflow.add_argument(
+        "--reason", required=True, help="Non-empty reason recorded on the qc_passed lifecycle transition"
+    )
+    run_final_qc_workflow.add_argument(
+        "--require-overlays",
+        default="false",
+        choices=["true", "false"],
+        help="Whether overlay_render is required for the report to pass (default: false)",
+    )
+    run_final_qc_workflow.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    run_final_qc_workflow.set_defaults(func=cmd_run_final_qc_workflow)
 
     return parser
 
