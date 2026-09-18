@@ -2131,8 +2131,8 @@ def cmd_derive_text_overlays(args: argparse.Namespace) -> int:
     try:
         try:
             conn = get_readonly_connection()
-        except sqlite3.Error as exc:
-            return _fail(f"no local project database found: {exc}")
+        except sqlite3.Error:
+            return _fail("no local project database found")
 
         try:
             project = get_project(conn, args.project_id)

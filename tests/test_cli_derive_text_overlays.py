@@ -336,6 +336,57 @@ def test_cli_invalid_format_rejects(isolated_db, tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------
+# sqlite3.Error from get_readonly_connection() must never expose raw
+# exception text — same sanitized "no local project database found"
+# message the final-video-assembly and text-overlay-renderer command
+# paths already use.
+# ---------------------------------------------------------------------
+
+_SENTINEL_SQLITE_ERROR = "SENTINEL-SQLITE-ERROR-C:\\sensitive\\project.db"
+
+
+def test_cli_text_sqlite_error_is_sanitized(tmp_path, capsys, monkeypatch):
+    def _boom():
+        raise sqlite3.OperationalError(_SENTINEL_SQLITE_ERROR)
+
+    monkeypatch.setattr("src.database.db.get_readonly_connection", _boom)
+
+    manifest_path = tmp_path / "m.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    rc = cli.cmd_derive_text_overlays(_args("proj-x", manifest_path, tmp_path / "out.json"))
+    out, err = capsys.readouterr()
+
+    assert rc != 0
+    assert out == ""
+    assert "no local project database found" in err
+    assert _SENTINEL_SQLITE_ERROR not in err
+    assert _SENTINEL_SQLITE_ERROR not in out
+
+
+def test_cli_json_sqlite_error_is_sanitized(tmp_path, capsys, monkeypatch):
+    def _boom():
+        raise sqlite3.OperationalError(_SENTINEL_SQLITE_ERROR)
+
+    monkeypatch.setattr("src.database.db.get_readonly_connection", _boom)
+
+    manifest_path = tmp_path / "m.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    rc = cli.cmd_derive_text_overlays(
+        _args("proj-x", manifest_path, tmp_path / "out.json", out_format="json")
+    )
+    out, err = capsys.readouterr()
+
+    assert rc != 0
+    assert out == ""
+    payload = json.loads(err)
+    assert payload["ok"] is False
+    assert "no local project database found" in payload["reason"]
+    assert _SENTINEL_SQLITE_ERROR not in err
+    for value in payload.values():
+        assert _SENTINEL_SQLITE_ERROR not in str(value)
+
+
+# ---------------------------------------------------------------------
 # 48-50: output path conflicts
 # ---------------------------------------------------------------------
 
