@@ -2230,6 +2230,129 @@ def cmd_derive_text_overlays(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan_final_assembly(args: argparse.Namespace) -> int:
+    """FINAL ASSEMBLY PLANNER V1: local-only, read-only readiness report
+    for the render -> overlay-derivation -> overlay-rendering tail of the
+    pipeline — the part dry-run/resume-plan cannot see, since neither the
+    "overlay_render" ArtifactKind nor the manifest-file-based
+    overlay-derivation step is part of the ProjectStage lifecycle model.
+    This command complements, and never replaces, dry-run/resume-plan/
+    verify-artifacts/verify-and-advance, and never calls
+    assemble-final-video/derive-text-overlays/render-text-overlays itself.
+
+    DB access shape follows cmd_derive_text_overlays exactly: one
+    short-lived get_readonly_connection(), used only to fetch the project
+    record and every registered artifact for it, closed via the `finally`
+    block BEFORE src.core.final_assembly_planner.build_final_assembly_plan()
+    (a pure function, no I/O of its own) is ever called.
+
+    stdout/stderr shape follows cmd_derive_text_overlays exactly: success
+    (text or JSON) goes to stdout; a domain error (text or JSON) goes to
+    stderr. An undocumented/unexpected exception is caught at this
+    boundary and reported as one short, generic, sanitized message — never
+    the original exception's own text, traceback, or any environment/
+    provider credential. KeyboardInterrupt/SystemExit are BaseException,
+    not Exception, so neither is ever caught here.
+
+    No --output argument exists: this command never writes a manifest,
+    never registers an artifact, never opens a write database connection,
+    and never shells out to FFmpeg/ffprobe, never imports a provider, and
+    never touches the network."""
+    from src.core.final_assembly_planner import FinalAssemblyPlannerError, build_final_assembly_plan
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.database.artifact_repository import list_artifacts_by_project
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"plan-final-assembly: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {"ok": False, "project_id": args.project_id, "reason": reason}
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True), file=sys.stderr)
+        else:
+            print(f"plan-final-assembly: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        try:
+            conn = get_readonly_connection()
+        except sqlite3.Error:
+            return _fail("no local project database found")
+
+        try:
+            project = get_project(conn, args.project_id)
+            if project is None:
+                return _fail(f"no project found with project_id {args.project_id!r}")
+
+            artifacts = list_artifacts_by_project(conn, args.project_id)
+        finally:
+            conn.close()
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError as exc:
+            return _fail(str(exc))
+
+        try:
+            plan = build_final_assembly_plan(project, manifest, artifacts)
+        except FinalAssemblyPlannerError as exc:
+            return _fail(str(exc))
+    except Exception:
+        return _fail("an unexpected internal error occurred")
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": plan.project_id,
+            "manifest_project_id_matches": plan.manifest_project_id_matches,
+            "manifest_fingerprint_matches": plan.manifest_fingerprint_matches,
+            "render_artifact_id": plan.render_artifact_id,
+            "render_ready": plan.render_ready,
+            "render_duration_seconds": plan.render_duration_seconds,
+            "overlay_count": plan.overlay_count,
+            "manifest_has_explicit_overlays": plan.manifest_has_explicit_overlays,
+            "overlay_render_artifact_id": plan.overlay_render_artifact_id,
+            "overlay_render_ready": plan.overlay_render_ready,
+            "final_viewer_output_kind": plan.final_viewer_output_kind,
+            "final_viewer_output_relative_path": plan.final_viewer_output_relative_path,
+            "next_safe_local_command": plan.next_safe_local_command,
+            "next_command_requires_explicit_paths": plan.next_command_requires_explicit_paths,
+            "blocked_reasons": list(plan.blocked_reasons),
+            "notes": list(plan.notes),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("plan-final-assembly: OK (read-only planning/reporting only)")
+        print(f"  project_id: {plan.project_id}")
+        print(f"  manifest_project_id_matches: {plan.manifest_project_id_matches}")
+        print(f"  manifest_fingerprint_matches: {plan.manifest_fingerprint_matches}")
+        print(f"  render_artifact_id: {plan.render_artifact_id}")
+        print(f"  render_ready: {plan.render_ready}")
+        print(f"  render_duration_seconds: {plan.render_duration_seconds}")
+        print(f"  overlay_count: {plan.overlay_count}")
+        print(f"  manifest_has_explicit_overlays: {plan.manifest_has_explicit_overlays}")
+        print(f"  overlay_render_artifact_id: {plan.overlay_render_artifact_id}")
+        print(f"  overlay_render_ready: {plan.overlay_render_ready}")
+        print(f"  final_viewer_output_kind: {plan.final_viewer_output_kind}")
+        print(f"  final_viewer_output_relative_path: {plan.final_viewer_output_relative_path}")
+        print(f"  next_safe_local_command: {plan.next_safe_local_command}")
+        print(f"  next_command_requires_explicit_paths: {plan.next_command_requires_explicit_paths}")
+        print("  blocked_reasons:")
+        for reason in plan.blocked_reasons:
+            print(f"    - {reason}")
+        print("  notes:")
+        for note in plan.notes:
+            print(f"    - {note}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -2627,6 +2750,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     derive_text_overlays.set_defaults(func=cmd_derive_text_overlays)
+
+    plan_final_assembly = sub.add_parser(
+        "plan-final-assembly",
+        help="Local-only, read-only readiness report for the render -> overlay-derivation -> "
+        "overlay-rendering tail of the pipeline; never calls assemble-final-video/"
+        "derive-text-overlays/render-text-overlays itself, no provider, no FFmpeg, no network call",
+    )
+    plan_final_assembly.add_argument("project_id")
+    plan_final_assembly.add_argument(
+        "--manifest", required=True, help="Path to the VideoManifest JSON to plan against"
+    )
+    plan_final_assembly.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    plan_final_assembly.set_defaults(func=cmd_plan_final_assembly)
 
     return parser
 
