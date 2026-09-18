@@ -2450,6 +2450,205 @@ def cmd_build_final_local(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _qc_check_result_payload(check) -> dict:
+    return {"check_id": check.check_id, "passed": check.passed, "subject": check.subject, "message": check.message}
+
+
+def _qc_report_payload(report) -> dict:
+    """Every FinalQcReport field, "passed" a genuine top-level JSON
+    boolean — this exact shape is what register-qc-report-artifact's own
+    _validate_qc_report() already requires, so the written file can be
+    handed to it unchanged."""
+    return {
+        "passed": report.passed,
+        "project_id": report.project_id,
+        "require_overlays": report.require_overlays,
+        "render_checks": [_qc_check_result_payload(c) for c in report.render_checks],
+        "overlay_render_checks": [_qc_check_result_payload(c) for c in report.overlay_render_checks],
+        "overlay_render_present": report.overlay_render_present,
+        "viewer_facing_output_kind": report.viewer_facing_output_kind,
+        "viewer_facing_output_relative_path": report.viewer_facing_output_relative_path,
+        "blocking_reasons": list(report.blocking_reasons),
+        "warnings": list(report.warnings),
+        "generated_at": report.generated_at,
+    }
+
+
+def _render_verify_final_output_text(report) -> str:
+    status = "PASS" if report.passed else "FAIL"
+    lines = [
+        f"verify-final-output: {status}",
+        f"  project_id: {report.project_id}",
+        f"  passed: {report.passed}",
+        f"  require_overlays: {report.require_overlays}",
+        f"  overlay_render_present: {report.overlay_render_present}",
+        f"  viewer_facing_output_kind: {report.viewer_facing_output_kind}",
+        f"  viewer_facing_output_relative_path: {report.viewer_facing_output_relative_path}",
+        f"  generated_at: {report.generated_at}",
+        "  render_checks:",
+    ]
+    for c in report.render_checks:
+        lines.append(f"    [{'PASS' if c.passed else 'FAIL'}] {c.check_id}: {c.message}")
+    lines.append("  overlay_render_checks:")
+    for c in report.overlay_render_checks:
+        lines.append(f"    [{'PASS' if c.passed else 'FAIL'}] {c.check_id}: {c.message}")
+    lines.append("  blocking_reasons:")
+    for reason in report.blocking_reasons:
+        lines.append(f"    - {reason}")
+    lines.append("  warnings:")
+    for warning in report.warnings:
+        lines.append(f"    - {warning}")
+    return "\n".join(lines)
+
+
+def cmd_verify_final_output(args: argparse.Namespace) -> int:
+    """FINAL QC GATE V1: local-only, read-only verification of a project's
+    real on-disk render/overlay_render output, writing exactly one new,
+    immutable JSON report to --report-output. Never registers that report,
+    never mutates a project's lifecycle stage, never touches render/
+    final.mp4, overlay_render/final.mp4, any source artifact, or the
+    supplied manifest — the intended follow-up is entirely manual:
+    register-qc-report-artifact PROJECT_ID --file <report-output>, then
+    verify-and-advance PROJECT_ID --to-stage qc_passed --reason "...".
+    Neither is called from here.
+
+    DB access shape: exactly one short-lived get_readonly_connection(),
+    used only to fetch the project record and every registered artifact,
+    closed via the `finally` block BEFORE any path-collision resolution,
+    manifest load, src.core.final_qc_gate.verify_final_output() call
+    (which itself performs local ffprobe subprocess calls but no I/O of
+    its own beyond that), or the report file write.
+
+    A domain error prevents any file from being written at all (--report-
+    output already exists, aliases a protected path, DB unavailable,
+    unknown project, unreadable manifest, ProjectManifestMismatchError,
+    ArtifactTopologyError, FinalQcProbeError, or a write/serialization
+    failure) — reported via stderr, text or JSON, exactly like every other
+    domain error on this command. An ORDINARY failed QC report (passed
+    False) is a completely different outcome: the report is written and
+    printed to stdout normally, in both formats, and only the exit code is
+    non-zero.
+
+    An undocumented/unexpected exception is caught at this boundary and
+    reported as one short, generic, sanitized message — never the original
+    exception's own text, traceback, or any environment/provider
+    credential. KeyboardInterrupt/SystemExit are BaseException, not
+    Exception, so neither is ever caught here."""
+    import tempfile
+
+    from src.core.final_qc_gate import (
+        ArtifactTopologyError,
+        FinalQcProbeError,
+        ProjectManifestMismatchError,
+        verify_final_output,
+    )
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.path_safety import resolve_under_project_dir
+    from src.database.artifact_repository import list_artifacts_by_project
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"verify-final-output: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    require_overlays = args.require_overlays == "true"
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {"ok": False, "project_id": args.project_id, "reason": reason}
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True), file=sys.stderr)
+        else:
+            print(f"verify-final-output: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        report_output_resolved = Path(args.report_output).resolve()
+        if report_output_resolved.exists():
+            return _fail("--report-output already exists")
+
+        try:
+            conn = get_readonly_connection()
+        except sqlite3.Error:
+            return _fail("no local project database found")
+
+        try:
+            project = get_project(conn, args.project_id)
+            if project is None:
+                return _fail(f"no project found with project_id {args.project_id!r}")
+            artifacts = list_artifacts_by_project(conn, args.project_id)
+        finally:
+            conn.close()
+
+        manifest_path_resolved = Path(args.manifest).resolve()
+        canonical_manifest_resolved = Path(project.manifest_path).resolve()
+        project_dir_resolved = canonical_manifest_resolved.parent
+
+        protected = {
+            "the project's canonical manifest path": canonical_manifest_resolved,
+            "the supplied --manifest path": manifest_path_resolved,
+            "render/final.mp4 under the project directory": project_dir_resolved / "render" / "final.mp4",
+            "overlay_render/final.mp4 under the project directory": (
+                project_dir_resolved / "overlay_render" / "final.mp4"
+            ),
+        }
+        for artifact in artifacts:
+            resolved = resolve_under_project_dir(project_dir_resolved, artifact.relative_path)
+            if resolved is not None:
+                protected[f"registered {artifact.kind} artifact {artifact.artifact_id!r}"] = resolved
+
+        report_output_normcase = os.path.normcase(str(report_output_resolved))
+        for label, path in protected.items():
+            if report_output_normcase == os.path.normcase(str(path.resolve())):
+                return _fail(f"--report-output must not alias {label}")
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError as exc:
+            return _fail(str(exc))
+
+        try:
+            report = verify_final_output(
+                project=project,
+                manifest=manifest,
+                artifacts=artifacts,
+                project_dir=project_dir_resolved,
+                require_overlays=require_overlays,
+            )
+        except (ProjectManifestMismatchError, ArtifactTopologyError, FinalQcProbeError) as exc:
+            return _fail(str(exc))
+
+        payload = _qc_report_payload(report)
+        text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+
+        report_output_resolved.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(report_output_resolved.parent), prefix=f".{report_output_resolved.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp_name, report_output_resolved)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            return _fail("could not write --report-output")
+    except Exception:
+        return _fail("an unexpected internal error occurred")
+
+    if out_format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(_render_verify_final_output_text(report))
+    return 0 if report.passed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -2889,6 +3088,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     build_final_local.set_defaults(func=cmd_build_final_local)
+
+    verify_final_output = sub.add_parser(
+        "verify-final-output",
+        help="Local-only, read-only verification of a project's real on-disk render/overlay_render "
+        "output; writes exactly one new, immutable JSON report to --report-output, never registers it "
+        "and never changes lifecycle state; no provider, no network call",
+    )
+    verify_final_output.add_argument("project_id")
+    verify_final_output.add_argument(
+        "--manifest", required=True, help="Path to the VideoManifest JSON actually used to render the output"
+    )
+    verify_final_output.add_argument(
+        "--report-output", required=True, help="Path to write the QC report JSON; must not already exist"
+    )
+    verify_final_output.add_argument(
+        "--require-overlays",
+        default="false",
+        choices=["true", "false"],
+        help="Whether overlay_render is required for the report to pass (default: false)",
+    )
+    verify_final_output.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    verify_final_output.set_defaults(func=cmd_verify_final_output)
 
     return parser
 
