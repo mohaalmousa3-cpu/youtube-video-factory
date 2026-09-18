@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import shutil
 import socket
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from src.core.project_state_machine import create_initial_project, initial_trans
 from src.core.scene_timing_finalizer import finalize_scene_timing
 from src.core.text_overlay_render import TextOverlayRenderError
 from src.database.artifact_repository import register_artifact
-from src.database.db import get_connection, init_db
+from src.database.db import get_connection, get_readonly_connection, init_db
 from src.database.project_repository import create_project
 from src.models.artifact import ArtifactRecord
 from src.utils.channel_config import get_channel_policy
@@ -496,6 +497,145 @@ def test_overlay_render_reload_mismatch_raises(isolated_db, tmp_path, monkeypatc
 
     with pytest.raises(LocalResumeOrchestratorError):
         build_final_local(project_id=project_id, timed_manifest_path=project_dir / "manifest.json", **_paths(tmp_path))
+
+
+# ---------------------------------------------------------------------
+# DB connection lifecycle proof: every SQLite connection the orchestrator
+# itself opens (via get_readonly_connection, the only connection factory
+# it imports/calls — see src/core/local_resume_orchestrator.py's own
+# imports) must be closed before each of assemble_final_video(),
+# derive_text_overlays(), save_manifest(), and render_text_overlays() is
+# invoked. A closed sqlite3.Connection raises sqlite3.ProgrammingError on
+# any further use, so that is what these tests assert directly on the
+# real connection objects the orchestrator returned — not merely on
+# source text.
+# ---------------------------------------------------------------------
+
+
+def _tracking_readonly_connection(tracked: list):
+    def _tracking():
+        conn = get_readonly_connection()
+        tracked.append(conn)
+        return conn
+
+    return _tracking
+
+
+def _assert_all_closed(tracked: list) -> None:
+    assert tracked, "expected the orchestrator to have opened at least one connection by this point"
+    for conn in tracked:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_connections_closed_before_assemble_when_render_missing(isolated_db, tmp_path, monkeypatch):
+    """Scenario A: render missing."""
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects")
+    tracked: list = []
+    monkeypatch.setattr(f"{MODULE}.get_readonly_connection", _tracking_readonly_connection(tracked))
+
+    real_assemble = _fake_assemble_final_video()
+
+    def _checking_assemble(project_id_arg, manifest_path_arg, output_path_arg):
+        _assert_all_closed(tracked)
+        return real_assemble(project_id_arg, manifest_path_arg, output_path_arg)
+
+    monkeypatch.setattr(f"{MODULE}.assemble_final_video", _checking_assemble)
+    monkeypatch.setattr(f"{MODULE}.render_text_overlays", _fake_render_text_overlays())
+
+    result = build_final_local(
+        project_id=project_id, timed_manifest_path=project_dir / "manifest.json", **_paths(tmp_path)
+    )
+    assert result.stopped_at_stage is None
+    _assert_all_closed(tracked)  # also closed by the time the call returns
+
+
+def test_connections_closed_before_each_call_when_render_exists_no_overlays(isolated_db, tmp_path, monkeypatch):
+    """Scenario B: render exists, manifest has no explicit overlays — checks
+    the three call sites this path reaches: derive_text_overlays(),
+    save_manifest(), and render_text_overlays()."""
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects")
+    _register(_render_artifact_record(project_id))
+    tracked: list = []
+    monkeypatch.setattr(f"{MODULE}.get_readonly_connection", _tracking_readonly_connection(tracked))
+
+    def _checking_derive(manifest_arg, render_artifact_arg):
+        _assert_all_closed(tracked)
+        return derive_text_overlays(manifest_arg, render_artifact_arg)
+
+    def _checking_save(manifest_arg, path_arg):
+        _assert_all_closed(tracked)
+        return save_manifest(manifest_arg, path_arg)
+
+    real_render = _fake_render_text_overlays()
+
+    def _checking_render(project_id_arg, manifest_path_arg, output_path_arg):
+        _assert_all_closed(tracked)
+        return real_render(project_id_arg, manifest_path_arg, output_path_arg)
+
+    monkeypatch.setattr(f"{MODULE}.derive_text_overlays", _checking_derive)
+    monkeypatch.setattr(f"{MODULE}.save_manifest", _checking_save)
+    monkeypatch.setattr(f"{MODULE}.render_text_overlays", _checking_render)
+
+    result = build_final_local(
+        project_id=project_id, timed_manifest_path=project_dir / "manifest.json", **_paths(tmp_path)
+    )
+    assert result.stopped_at_stage is None
+    _assert_all_closed(tracked)
+
+
+def test_connections_closed_before_render_when_render_exists_with_overlays(isolated_db, tmp_path, monkeypatch):
+    """Scenario C: render exists, manifest already has explicit overlays —
+    only render_text_overlays() is reached."""
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects", overlays_by_scene={"scene-01": [_overlay_dict()]}
+    )
+    _register(_render_artifact_record(project_id))
+    tracked: list = []
+    monkeypatch.setattr(f"{MODULE}.get_readonly_connection", _tracking_readonly_connection(tracked))
+    monkeypatch.setattr(
+        f"{MODULE}.derive_text_overlays", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run"))
+    )
+    monkeypatch.setattr(
+        f"{MODULE}.save_manifest", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run"))
+    )
+
+    real_render = _fake_render_text_overlays()
+
+    def _checking_render(project_id_arg, manifest_path_arg, output_path_arg):
+        _assert_all_closed(tracked)
+        return real_render(project_id_arg, manifest_path_arg, output_path_arg)
+
+    monkeypatch.setattr(f"{MODULE}.render_text_overlays", _checking_render)
+
+    result = build_final_local(
+        project_id=project_id, timed_manifest_path=project_dir / "manifest.json", **_paths(tmp_path)
+    )
+    assert result.stopped_at_stage is None
+    _assert_all_closed(tracked)
+
+
+def test_connections_closed_and_no_stage_called_when_overlay_render_valid(isolated_db, tmp_path, monkeypatch):
+    """Scenario D: a valid overlay_render already exists — no stage
+    function is ever called, and every connection the orchestrator opened
+    while reaching that conclusion is closed by the time it returns."""
+    project_id, project_dir, manifest = _create_registered_project(tmp_path / "projects")
+    render = _render_artifact_record(project_id)
+    _register(render)
+    _register(_overlay_render_artifact_record(project_id, render, manifest, overlay_count=0))
+    tracked: list = []
+    monkeypatch.setattr(f"{MODULE}.get_readonly_connection", _tracking_readonly_connection(tracked))
+    for name in ("assemble_final_video", "derive_text_overlays", "save_manifest", "render_text_overlays"):
+        monkeypatch.setattr(
+            f"{MODULE}.{name}", lambda *a, **k: (_ for _ in ()).throw(AssertionError(f"{name} should not run"))
+        )
+
+    result = build_final_local(
+        project_id=project_id, timed_manifest_path=project_dir / "manifest.json", **_paths(tmp_path)
+    )
+    assert result.stopped_at_stage is None
+    assert result.overlay_render_status == "overlay_render_reused"
+    _assert_all_closed(tracked)
 
 
 # ---------------------------------------------------------------------
