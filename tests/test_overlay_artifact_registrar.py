@@ -145,10 +145,10 @@ def test_valid_overlay_registration(conn, tmp_path):
     assert result.idempotent is False
     assert result.copied is True
     assert result.artifact_id == "overlay-render-final"
-    assert result.relative_path == "overlay/final.mp4"
+    assert result.relative_path == "overlay_render/final.mp4"
     assert result.duration_seconds == pytest.approx(1.0, abs=0.2)
 
-    destination = project_dir / "overlay" / "final.mp4"
+    destination = project_dir / "overlay_render" / "final.mp4"
     assert destination.exists()
     assert destination.read_bytes() == source.read_bytes()
 
@@ -157,7 +157,47 @@ def test_valid_overlay_registration(conn, tmp_path):
     assert stored[0].artifact_id == "overlay-render-final"
     assert stored[0].kind == "overlay_render"
     assert stored[0].scene_id is None
+    assert stored[0].relative_path == "overlay_render/final.mp4"
     assert stored[0].metadata["source"] == "text-overlay-renderer-v1"
+
+
+def test_canonical_path_is_exactly_overlay_render_final_mp4(conn, tmp_path):
+    """STEP 4 (second corrective pass): the fixed canonical path is
+    exactly overlay_render/final.mp4 — a distinct directory from
+    render/final.mp4, never overlay/final.mp4."""
+    project, manifest, project_dir = _registered_project(conn, tmp_path)
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0)
+
+    result = register_overlay_render_artifact(conn, project, manifest, source, now=FIXED_NOW)
+
+    assert result.ok is True
+    assert result.relative_path == "overlay_render/final.mp4"
+    stored = list_artifacts_by_project(conn, project.project_id, kind="overlay_render")[0]
+    assert stored.relative_path == "overlay_render/final.mp4"
+    assert (project_dir / "overlay_render" / "final.mp4").exists()
+    assert not (project_dir / "overlay").exists()
+    assert not (project_dir / "overlay" / "final.mp4").exists()
+
+
+def test_pre_existing_render_directory_never_touched(conn, tmp_path):
+    """A pre-existing render/final.mp4 (this project's actual render
+    artifact) must never be read, moved, or overwritten by registering an
+    overlay_render artifact — they live in entirely separate directories."""
+    project, manifest, project_dir = _registered_project(conn, tmp_path)
+    render_dir = project_dir / "render"
+    render_dir.mkdir(parents=True)
+    render_path = render_dir / "final.mp4"
+    render_path.write_bytes(b"the real render artifact, never to be touched")
+    render_bytes_before = render_path.read_bytes()
+
+    source = tmp_path / "source.mp4"
+    _real_mp4(source, duration_seconds=1.0)
+
+    result = register_overlay_render_artifact(conn, project, manifest, source, now=FIXED_NOW)
+
+    assert result.ok is True
+    assert render_path.read_bytes() == render_bytes_before
 
 
 # ---------------------------------------------------------------------
@@ -212,7 +252,7 @@ def test_video_only_source_rejected_before_any_copy(conn, tmp_path):
 
     assert result.ok is False
     assert "audio stream" in result.reasons[0]
-    assert not (project_dir / "overlay").exists()
+    assert not (project_dir / "overlay_render").exists()
     assert list_artifacts_by_project(conn, project.project_id, kind="overlay_render") == []
 
 
@@ -225,7 +265,7 @@ def test_missing_source_file_causes_zero_writes(conn, tmp_path):
 
     assert result.ok is False
     assert "does not exist" in result.reasons[0]
-    assert not (project_dir / "overlay").exists()
+    assert not (project_dir / "overlay_render").exists()
 
 
 def test_mismatched_manifest_project_id_raises_and_causes_zero_writes(conn, tmp_path):
@@ -363,7 +403,7 @@ def test_strict_cleanup_unlink_failure_raises_cleanup_error(conn, tmp_path, monk
 
     monkeypatch.setattr("src.core.overlay_artifact_registrar.register_artifact", _boom)
 
-    destination = project_dir / "overlay" / "final.mp4"
+    destination = project_dir / "overlay_render" / "final.mp4"
     real_unlink = Path.unlink
 
     def _fail_unlink(self, *a, **k):

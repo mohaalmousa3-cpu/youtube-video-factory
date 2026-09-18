@@ -17,7 +17,7 @@ row per project, fixed and deterministic:
     artifact_id:    overlay-render-final
     kind:           overlay_render
     scene_id:       None
-    relative_path:  overlay/final.mp4
+    relative_path:  overlay_render/final.mp4
 
 This module never renders, never invokes ffmpeg's *encode* path itself
 (src/core/text_overlay_render.py does that), never mutates the manifest or
@@ -70,7 +70,7 @@ from src.utils.config import get_settings
 _CHUNK_SIZE = 1024 * 1024
 
 _ARTIFACT_ID = "overlay-render-final"
-_RELATIVE_PATH = "overlay/final.mp4"
+_RELATIVE_PATH = "overlay_render/final.mp4"
 
 
 class OverlayArtifactRegistrationError(Exception):
@@ -96,7 +96,7 @@ class OverlaySourceMismatchError(Exception):
 class OverlayArtifactCleanupError(Exception):
     """Raised by register_overlay_render_artifact() only when
     `strict_cleanup=True` AND this call's own freshly-copied canonical
-    overlay/final.mp4 copy could not be removed after a registration
+    overlay_render/final.mp4 copy could not be removed after a registration
     failure. Default (`strict_cleanup=False`) callers keep the original
     best-effort, silently-swallowed cleanup behavior."""
 

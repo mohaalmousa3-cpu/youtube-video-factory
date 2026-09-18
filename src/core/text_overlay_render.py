@@ -25,14 +25,24 @@ V1 SCOPE, DELIBERATE AND NARROW:
     docs/spec-v4/TECHNICAL-SPEC-EN.md section 8's "deterministically
     generated from manifest/scene data" language, which describes a
     capability this module does not yet implement).
-  - TextOverlay.start_seconds/end_seconds are interpreted as ABSOLUTE
-    seconds on the SOURCE RENDER ARTIFACT's own timeline (not
+  - TextOverlay.start_seconds/end_seconds are interpreted as ABSOLUTE,
+    REQUIRED seconds on the SOURCE RENDER ARTIFACT's own timeline (not
     scene-relative) — a deliberate v1 simplification, since the model
     itself does not document which convention is intended and computing
     a scene's cumulative offset would require re-deriving per-scene
     durations from the (untouched, per this phase's explicit
-    constraints) audio/animation artifacts. None supplied defaults to the
-    full [0, source_duration] range.
+    constraints) audio/animation artifacts. V1 does NOT default a missing
+    start_seconds/end_seconds to the full source duration — either being
+    None raises MissingOverlayTimingError before any ffmpeg work. Once
+    both are supplied: start_seconds must be >= 0, end_seconds must be
+    strictly greater than start_seconds (equality is rejected), and
+    end_seconds may exceed the source render's measured duration by at
+    most _TIMING_TOLERANCE_SECONDS (a small, fixed ffprobe-rounding
+    allowance) — but the actual `between(t, start, end)` interval burned
+    into the drawtext filter is always clamped to the real source
+    duration, so no overlay is ever rendered outside the source render's
+    own runtime even when its declared end_seconds is a few milliseconds
+    past it.
   - Exactly three fixed (style_id, position) pairs are supported:
     "lower_third_primary"/"lower_third", "center_emphasis"/"center",
     "top_label"/"top" — see _STYLES below. Any other style_id, or a
@@ -71,7 +81,7 @@ This module never alters, overwrites, unregisters, or replaces: the
 "render" artifact's own row, render/final.mp4 itself, any audio/animation
 artifact, the source manifest file, or any other pre-existing project
 file — it only ever reads the "render" artifact and writes NEW files
-(--output and, on success, overlay/final.mp4 via the registrar)."""
+(--output and, on success, overlay_render/final.mp4 via the registrar)."""
 from __future__ import annotations
 
 import json
@@ -110,13 +120,22 @@ _FONT_PATH = Path(r"C:\Windows\Fonts\arial.ttf")
 _MAX_OVERLAY_TEXT_LENGTH = 80
 _DURATION_TOLERANCE_SECONDS = 0.25
 
+# Fixed v1 timing tolerance: an overlay's end_seconds may exceed the
+# source render's measured duration by at most this many seconds before
+# being rejected outright (small ffprobe-rounding allowance only). Never
+# used to extend the actual rendered interval — the between(t, start,
+# end) value passed to drawtext is always clamped to the real duration,
+# never to start+tolerance.
+_TIMING_TOLERANCE_SECONDS = 0.05
+
 # The only three (style_id, position) pairs TEXT OVERLAY RENDERER V1
-# supports. font_size/margin_px are deliberately fixed, not configurable,
-# per the locked v1 scope.
+# supports. font_size/margin_px/boxborderw are the exact, fixed, locked
+# v1 visual contract — not configurable.
+_BOX_BORDER_WIDTH = 18
 _STYLES: dict[str, dict] = {
-    "lower_third_primary": {"position": "lower_third", "font_size": 42, "margin_px": 60},
-    "center_emphasis": {"position": "center", "font_size": 54, "margin_px": 0},
-    "top_label": {"position": "top", "font_size": 36, "margin_px": 40},
+    "lower_third_primary": {"position": "lower_third", "font_size": 52, "margin_px": 150},
+    "center_emphasis": {"position": "center", "font_size": 64, "margin_px": 0},
+    "top_label": {"position": "top", "font_size": 44, "margin_px": 80},
 }
 
 
@@ -178,10 +197,18 @@ class OverlayTextTooLongError(TextOverlayRenderError):
     """A TextOverlay's text exceeds the v1 maximum visible length."""
 
 
+class MissingOverlayTimingError(TextOverlayRenderError):
+    """A TextOverlay's start_seconds or end_seconds is None. V1 requires
+    both explicitly on every overlay and never defaults a missing value
+    to the full source duration — raised before any ffmpeg work."""
+
+
 class OverlayTimingOutOfRangeError(TextOverlayRenderError):
-    """A TextOverlay's start/end timing falls outside [0, source
-    duration], or start > end after defaulting — text must never be
-    scheduled outside the source render's own runtime."""
+    """A TextOverlay's start_seconds is negative, end_seconds is not
+    strictly greater than start_seconds, or end_seconds exceeds the
+    source render's measured duration by more than
+    _TIMING_TOLERANCE_SECONDS — text must never be scheduled outside the
+    source render's own runtime."""
 
 
 class OverlayFontNotFoundError(TextOverlayRenderError):
@@ -246,6 +273,12 @@ class _RenderPlan:
     output_path: Path
     render_source_path: Path
     render_artifact_id: str
+    # Captured from the resolved source "render" ArtifactRecord in Phase A
+    # (never re-derived/re-hashed from the file itself) — the authoritative
+    # stored checksum/relative_path this run's overlay_render lineage
+    # metadata must carry through unchanged.
+    render_artifact_sha256: str
+    render_artifact_relative_path: str
     overlays: tuple[_FlattenedOverlay, ...]
 
 
@@ -433,6 +466,8 @@ def _load_render_plan(project_id: str, manifest_path: Path, output_path: Path) -
         output_path=output_resolved,
         render_source_path=render_source_path,
         render_artifact_id=render_artifact.artifact_id,
+        render_artifact_sha256=render_artifact.sha256_checksum,
+        render_artifact_relative_path=render_artifact.relative_path,
         overlays=overlays,
     )
 
@@ -482,16 +517,27 @@ def _validate_and_build_filters(
                 f"{_MAX_OVERLAY_TEXT_LENGTH}"
             )
 
-        start = 0.0 if overlay.start_seconds is None else overlay.start_seconds
-        end = source_duration if overlay.end_seconds is None else overlay.end_seconds
+        if overlay.start_seconds is None or overlay.end_seconds is None:
+            raise MissingOverlayTimingError(
+                f"{label} must specify both start_seconds and end_seconds — TEXT OVERLAY RENDERER "
+                "V1 never defaults missing timing to the full source duration"
+            )
+        start = overlay.start_seconds
+        end = overlay.end_seconds
         if start < 0:
             raise OverlayTimingOutOfRangeError(f"{label} start_seconds must be >= 0")
-        if end > source_duration + 1e-6:
+        if end <= start:
             raise OverlayTimingOutOfRangeError(
-                f"{label} end_seconds ({end:.3f}) exceeds the source render's duration ({source_duration:.3f})"
+                f"{label} end_seconds must be strictly greater than start_seconds (equality is rejected)"
             )
-        if start > end:
-            raise OverlayTimingOutOfRangeError(f"{label} start_seconds must be <= end_seconds after defaulting")
+        if end > source_duration + _TIMING_TOLERANCE_SECONDS:
+            raise OverlayTimingOutOfRangeError(
+                f"{label} end_seconds ({end:.3f}) exceeds the source render's duration "
+                f"({source_duration:.3f}) beyond the {_TIMING_TOLERANCE_SECONDS:.2f}s tolerance"
+            )
+        # Never render past the real source duration, even when end_seconds
+        # is within the small accepted tolerance beyond it.
+        rendered_end = min(end, source_duration)
 
         text_file = tempdir / f"overlay-{_sanitize_for_filename(flat.scene_id, flat.index)}.txt"
         text_file.write_text(overlay.text, encoding="utf-8")
@@ -500,8 +546,9 @@ def _validate_and_build_filters(
         x_expr, y_expr = _position_expr(style["position"], style["margin_px"])
         filter_parts.append(
             f"drawtext=fontfile='{font_escaped}':textfile='{text_escaped}':"
-            f"fontsize={style['font_size']}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10:"
-            f"x={x_expr}:y={y_expr}:enable='between(t,{start:.3f},{end:.3f})'"
+            f"fontsize={style['font_size']}:fontcolor=white:box=1:boxcolor=black@0.6:"
+            f"boxborderw={_BOX_BORDER_WIDTH}:"
+            f"x={x_expr}:y={y_expr}:enable='between(t,{start:.3f},{rendered_end:.3f})'"
         )
 
     return ",".join(filter_parts)
@@ -612,6 +659,8 @@ def render_text_overlays(project_id: str, manifest_path: Path, output_path: Path
                     "source": "text-overlay-renderer-v1",
                     "overlay_count": len(plan.overlays),
                     "source_render_artifact_id": plan.render_artifact_id,
+                    "source_render_sha256": plan.render_artifact_sha256,
+                    "source_render_relative_path": plan.render_artifact_relative_path,
                     "manifest_fingerprint": plan.manifest.source_fingerprint,
                 }
                 try:

@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+
+from src.models.overlay import TextOverlay
 
 from src.core.text_overlay_render import (
     ArtifactFileNotFoundError,
@@ -20,6 +23,7 @@ from src.core.text_overlay_render import (
     InvalidManifestError,
     InvalidOverlayOutputError,
     ManifestNotFoundError,
+    MissingOverlayTimingError,
     NoOverlaysToRenderError,
     OutputPathConflictError,
     OverlayDrawError,
@@ -71,12 +75,19 @@ def _story_input_dict(story_id: str = "why-we-care-what-people-think") -> dict:
 
 
 def _overlay_dict(**overrides) -> dict:
+    """start_seconds/end_seconds are required at the renderer boundary
+    (V1 never defaults missing timing) — default to a safe [0.0, 1.0]
+    window that fits comfortably inside every _mock_ffmpeg_ok() default
+    source_duration (4.0s) used across this file; tests that need to
+    exercise timing rejection override these explicitly."""
     data = dict(
         text="The Cyberball Game",
         position="lower_third",
         style_id="lower_third_primary",
         viewer_facing_language="English",
         deterministic=True,
+        start_seconds=0.0,
+        end_seconds=1.0,
     )
     data.update(overrides)
     return data
@@ -225,6 +236,44 @@ def test_single_overlay_renders_and_registers(isolated_db, tmp_path, monkeypatch
     assert result.measured_duration_seconds == pytest.approx(4.0)
     assert result.artifact_id == "overlay-render-final"
     assert output.exists()
+
+
+def test_registered_metadata_contains_complete_source_lineage(isolated_db, tmp_path, monkeypatch):
+    """STEP 5 (second corrective pass): the persisted overlay_render
+    ArtifactRecord's metadata must contain the complete, exact source
+    lineage — including the source render's OWN stored checksum/relative
+    path (never re-hashed from the file), not just its artifact_id."""
+    from src.database.artifact_repository import list_artifacts_by_project
+
+    render_content = b"fake-render-bytes-for-lineage-test"
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects", overlays_by_scene={"scene-01": [_overlay_dict()]}
+    )
+    _register_render_artifact(project_dir, project_id, content=render_content)
+    _mock_ffmpeg_ok(monkeypatch, source_duration=4.0)
+    output = tmp_path / "overlay-final.mp4"
+
+    result = render_text_overlays(project_id, project_dir / "manifest.json", output)
+
+    conn = get_connection()
+    try:
+        overlays = list_artifacts_by_project(conn, project_id, kind="overlay_render")
+    finally:
+        conn.close()
+    assert len(overlays) == 1
+    assert overlays[0].relative_path == "overlay_render/final.mp4"
+    metadata = overlays[0].metadata
+    assert metadata["source"] == "text-overlay-renderer-v1"
+    assert metadata["overlay_count"] == 1
+    assert metadata["source_render_artifact_id"] == "render-final"
+    assert metadata["source_render_sha256"] == hashlib.sha256(render_content).hexdigest()
+    assert metadata["source_render_relative_path"] == "render/final.mp4"
+    assert metadata["manifest_fingerprint"] == manifest.source_fingerprint
+    assert metadata["duration_seconds"] == pytest.approx(result.measured_duration_seconds)
+    assert set(metadata.keys()) == {
+        "source", "overlay_count", "source_render_artifact_id", "source_render_sha256",
+        "source_render_relative_path", "manifest_fingerprint", "duration_seconds",
+    }
 
 
 def test_multiple_overlays_across_scenes_flattened_in_order(isolated_db, tmp_path, monkeypatch):
@@ -388,6 +437,70 @@ def test_style_id_position_mismatch_rejected(isolated_db, tmp_path, monkeypatch)
         render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
 
 
+def test_lower_third_primary_generates_exact_drawtext_fragment():
+    """STEP 3 (second corrective pass): the locked V1 visual contract
+    (font size 52, y margin 150, boxborderw 18, fontcolor/box/boxcolor)
+    must be exactly what reaches ffmpeg — asserted directly against
+    _validate_and_build_filters()'s own output, not inferred indirectly."""
+    from src.core.text_overlay_render import _FlattenedOverlay, _validate_and_build_filters
+
+    overlay = TextOverlay.model_validate(
+        _overlay_dict(style_id="lower_third_primary", position="lower_third", start_seconds=0.0, end_seconds=2.0)
+    )
+    flat = _FlattenedOverlay(scene_id="scene-01", index=0, overlay=overlay)
+
+    vf = _validate_and_build_filters((flat,), 4.0, Path(tempfile.mkdtemp()))
+
+    assert "fontsize=52" in vf
+    assert "x=(w-text_w)/2" in vf
+    assert "y=h-text_h-150" in vf
+    assert "fontcolor=white" in vf
+    assert "box=1" in vf
+    assert "boxcolor=black@0.6" in vf
+    assert "boxborderw=18" in vf
+    assert "between(t,0.000,2.000)" in vf
+
+
+def test_center_emphasis_generates_exact_drawtext_fragment():
+    from src.core.text_overlay_render import _FlattenedOverlay, _validate_and_build_filters
+
+    overlay = TextOverlay.model_validate(
+        _overlay_dict(style_id="center_emphasis", position="center", start_seconds=1.0, end_seconds=3.0)
+    )
+    flat = _FlattenedOverlay(scene_id="scene-01", index=0, overlay=overlay)
+
+    vf = _validate_and_build_filters((flat,), 4.0, Path(tempfile.mkdtemp()))
+
+    assert "fontsize=64" in vf
+    assert "x=(w-text_w)/2" in vf
+    assert "y=(h-text_h)/2" in vf
+    assert "fontcolor=white" in vf
+    assert "box=1" in vf
+    assert "boxcolor=black@0.6" in vf
+    assert "boxborderw=18" in vf
+    assert "between(t,1.000,3.000)" in vf
+
+
+def test_top_label_generates_exact_drawtext_fragment():
+    from src.core.text_overlay_render import _FlattenedOverlay, _validate_and_build_filters
+
+    overlay = TextOverlay.model_validate(
+        _overlay_dict(style_id="top_label", position="top", start_seconds=0.5, end_seconds=1.5)
+    )
+    flat = _FlattenedOverlay(scene_id="scene-01", index=0, overlay=overlay)
+
+    vf = _validate_and_build_filters((flat,), 4.0, Path(tempfile.mkdtemp()))
+
+    assert "fontsize=44" in vf
+    assert "x=(w-text_w)/2" in vf
+    assert "y=80" in vf
+    assert "fontcolor=white" in vf
+    assert "box=1" in vf
+    assert "boxcolor=black@0.6" in vf
+    assert "boxborderw=18" in vf
+    assert "between(t,0.500,1.500)" in vf
+
+
 def test_text_too_long_rejected(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(
         tmp_path / "projects",
@@ -400,7 +513,145 @@ def test_text_too_long_rejected(isolated_db, tmp_path, monkeypatch):
         render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
 
 
-def test_end_seconds_beyond_source_duration_rejected(isolated_db, tmp_path, monkeypatch):
+def test_negative_start_seconds_rejected_defensively():
+    """Unreachable via a real manifest — TextOverlay's own model_validator
+    already forbids start_seconds < 0 at construction (see
+    tests/test_manifest_models.py::test_text_overlay_rejects_negative_start).
+    Proven directly against the internal validator, same defensive-check
+    style as test_duplicate_scene_ids_rejected_defensively in
+    tests/test_final_video_assembly.py. end_seconds is a valid, positive
+    value here specifically so the (required) missing-timing check does
+    not short-circuit before reaching the negative-start check itself."""
+    from src.core.text_overlay_render import _FlattenedOverlay, _validate_and_build_filters
+    from types import SimpleNamespace
+
+    fake_overlay = SimpleNamespace(
+        text="x", position="lower_third", style_id="lower_third_primary",
+        start_seconds=-1.0, end_seconds=1.0,
+    )
+    flat = _FlattenedOverlay(scene_id="scene-01", index=0, overlay=fake_overlay)
+
+    with pytest.raises(OverlayTimingOutOfRangeError, match="start_seconds must be >= 0"):
+        _validate_and_build_filters((flat,), 4.0, Path("."))
+
+
+# ---------------------------------------------------------------------
+# STEP 2 (second corrective pass): timing is REQUIRED, never defaulted
+# ---------------------------------------------------------------------
+
+
+def test_missing_start_seconds_rejected_before_ffmpeg_encode(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects",
+        overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=None, end_seconds=1.0)]},
+    )
+    _register_render_artifact(project_dir, project_id)
+    calls = _mock_ffmpeg_ok(monkeypatch)
+
+    with pytest.raises(MissingOverlayTimingError):
+        render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    assert not any(c[0] == "ffmpeg_run" for c in calls)
+
+
+def test_missing_end_seconds_rejected_before_ffmpeg_encode(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects",
+        overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=0.0, end_seconds=None)]},
+    )
+    _register_render_artifact(project_dir, project_id)
+    calls = _mock_ffmpeg_ok(monkeypatch)
+
+    with pytest.raises(MissingOverlayTimingError):
+        render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    assert not any(c[0] == "ffmpeg_run" for c in calls)
+
+
+def test_both_timing_values_missing_rejected_before_ffmpeg_encode(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects",
+        overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=None, end_seconds=None)]},
+    )
+    _register_render_artifact(project_dir, project_id)
+    calls = _mock_ffmpeg_ok(monkeypatch)
+
+    with pytest.raises(MissingOverlayTimingError):
+        render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    assert not any(c[0] == "ffmpeg_run" for c in calls)
+
+
+def test_start_equals_end_rejected(isolated_db, tmp_path, monkeypatch):
+    """Equality must be rejected, not merely start > end."""
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects",
+        overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=1.0, end_seconds=1.0)]},
+    )
+    _register_render_artifact(project_dir, project_id)
+    _mock_ffmpeg_ok(monkeypatch, source_duration=4.0)
+
+    with pytest.raises(OverlayTimingOutOfRangeError, match="strictly greater"):
+        render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+
+def test_start_greater_than_end_rejected_defensively():
+    """Unreachable via a real manifest — TextOverlay's own model_validator
+    already forbids end_seconds < start_seconds at construction (a strict
+    manifest-build-time ValidationError, confirmed above by
+    test_start_greater_than_end_rejected's original attempt to build one).
+    Proven directly against the internal renderer-boundary validator,
+    same defensive-check style as test_negative_start_seconds_rejected_defensively."""
+    from src.core.text_overlay_render import _FlattenedOverlay, _validate_and_build_filters
+    from types import SimpleNamespace
+
+    fake_overlay = SimpleNamespace(
+        text="x", position="lower_third", style_id="lower_third_primary",
+        start_seconds=2.0, end_seconds=1.0,
+    )
+    flat = _FlattenedOverlay(scene_id="scene-01", index=0, overlay=fake_overlay)
+
+    with pytest.raises(OverlayTimingOutOfRangeError, match="strictly greater"):
+        _validate_and_build_filters((flat,), 4.0, Path("."))
+
+
+def test_end_exactly_at_source_duration_accepted(isolated_db, tmp_path, monkeypatch):
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects",
+        overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=0.0, end_seconds=4.0)]},
+    )
+    _register_render_artifact(project_dir, project_id)
+    calls = _mock_ffmpeg_ok(monkeypatch, source_duration=4.0)
+
+    result = render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    assert result.overlay_count == 1
+    ffmpeg_call = next(c for c in calls if c[0] == "ffmpeg_run")
+    vf = ffmpeg_call[1][ffmpeg_call[1].index("-vf") + 1]
+    assert "between(t,0.000,4.000)" in vf
+
+
+def test_end_within_tolerance_beyond_duration_accepted_and_clamped(isolated_db, tmp_path, monkeypatch):
+    """end_seconds up to 0.05s beyond the source duration is accepted, but
+    the actual FFmpeg `between()` interval burned into the filter must be
+    clamped to the real source duration — never rendered past it."""
+    project_id, project_dir, manifest = _create_registered_project(
+        tmp_path / "projects",
+        overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=0.0, end_seconds=4.03)]},
+    )
+    _register_render_artifact(project_dir, project_id)
+    calls = _mock_ffmpeg_ok(monkeypatch, source_duration=4.0)
+
+    result = render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
+
+    assert result.overlay_count == 1
+    ffmpeg_call = next(c for c in calls if c[0] == "ffmpeg_run")
+    vf = ffmpeg_call[1][ffmpeg_call[1].index("-vf") + 1]
+    assert "between(t,0.000,4.000)" in vf  # clamped to source duration, not 4.03
+    assert "4.030" not in vf
+
+
+def test_end_beyond_tolerance_rejected(isolated_db, tmp_path, monkeypatch):
     project_id, project_dir, manifest = _create_registered_project(
         tmp_path / "projects",
         overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=0.0, end_seconds=999.0)]},
@@ -410,55 +661,6 @@ def test_end_seconds_beyond_source_duration_rejected(isolated_db, tmp_path, monk
 
     with pytest.raises(OverlayTimingOutOfRangeError):
         render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
-
-
-def test_negative_start_seconds_rejected_defensively():
-    """Unreachable via a real manifest — TextOverlay's own model_validator
-    already forbids start_seconds < 0 at construction (see
-    tests/test_manifest_models.py::test_text_overlay_rejects_negative_start).
-    Proven directly against the internal validator, same defensive-check
-    style as test_duplicate_scene_ids_rejected_defensively in
-    tests/test_final_video_assembly.py."""
-    from src.core.text_overlay_render import _FlattenedOverlay, _validate_and_build_filters
-    from types import SimpleNamespace
-
-    fake_overlay = SimpleNamespace(
-        text="x", position="lower_third", style_id="lower_third_primary",
-        start_seconds=-1.0, end_seconds=None,
-    )
-    flat = _FlattenedOverlay(scene_id="scene-01", index=0, overlay=fake_overlay)
-
-    with pytest.raises(OverlayTimingOutOfRangeError, match="start_seconds must be >= 0"):
-        _validate_and_build_filters((flat,), 4.0, Path("."))
-
-
-def test_start_after_defaulted_end_rejected(isolated_db, tmp_path, monkeypatch):
-    """A reachable timing-range violation: start_seconds set well past the
-    source render's actual duration, with end_seconds left None (so it
-    defaults to that same duration) — after defaulting, start > end."""
-    project_id, project_dir, manifest = _create_registered_project(
-        tmp_path / "projects",
-        overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=2.0, end_seconds=None)]},
-    )
-    _register_render_artifact(project_dir, project_id)
-    _mock_ffmpeg_ok(monkeypatch, source_duration=1.0)
-
-    with pytest.raises(OverlayTimingOutOfRangeError):
-        render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
-
-
-def test_missing_timing_defaults_to_full_duration(isolated_db, tmp_path, monkeypatch):
-    """start_seconds/end_seconds both None must default to [0, source
-    duration] rather than being rejected."""
-    project_id, project_dir, manifest = _create_registered_project(
-        tmp_path / "projects",
-        overlays_by_scene={"scene-01": [_overlay_dict(start_seconds=None, end_seconds=None)]},
-    )
-    _register_render_artifact(project_dir, project_id)
-    _mock_ffmpeg_ok(monkeypatch, source_duration=4.0)
-
-    result = render_text_overlays(project_id, project_dir / "manifest.json", tmp_path / "out.mp4")
-    assert result.overlay_count == 1
 
 
 def test_missing_font_file_rejected(isolated_db, tmp_path, monkeypatch):
@@ -813,8 +1015,15 @@ def test_real_pipeline_integration(isolated_db, tmp_path):
     finally:
         conn.close()
     assert len(overlays) == 1
-    assert overlays[0].metadata["overlay_count"] == 1
-    assert overlays[0].metadata["source_render_artifact_id"] == "render-final"
+    assert overlays[0].relative_path == "overlay_render/final.mp4"
+    metadata = overlays[0].metadata
+    assert metadata["source"] == "text-overlay-renderer-v1"
+    assert metadata["overlay_count"] == 1
+    assert metadata["source_render_artifact_id"] == "render-final"
+    assert metadata["source_render_sha256"] == checksum
+    assert metadata["source_render_relative_path"] == "render/final.mp4"
+    assert metadata["manifest_fingerprint"] == manifest.source_fingerprint
+    assert metadata["duration_seconds"] == pytest.approx(result.measured_duration_seconds)
 
     leftover = [p for p in tmp_path.iterdir() if p.name.startswith("text-overlay-render-")]
     assert leftover == []
