@@ -33,7 +33,13 @@ ExecutionStatus = Literal["not_executed"]
 
 # Phase 2B: what kind of local file one ArtifactRecord (src/models/artifact.py)
 # describes. "audio", "visual", and "animation" are scene-level (one per
-# scene, e.g. one scene's narration WAV or generated image); "render" and
-# "qc_report" are project-level (one per whole video) — see
-# src/models/artifact.py's SCENE_LEVEL_ARTIFACT_KINDS / PROJECT_LEVEL_ARTIFACT_KINDS.
-ArtifactKind = Literal["audio", "visual", "animation", "render", "qc_report"]
+# scene, e.g. one scene's narration WAV or generated image); "render",
+# "qc_report", and "overlay_render" are project-level (one per whole
+# video) — see src/models/artifact.py's SCENE_LEVEL_ARTIFACT_KINDS /
+# PROJECT_LEVEL_ARTIFACT_KINDS. "overlay_render" (added for TEXT OVERLAY
+# RENDERER V1, src/core/text_overlay_render.py) is a DISTINCT artifact
+# from "render" — it is the deterministic text-overlay-burned-in copy of
+# an already-registered "render" artifact, never a replacement for it;
+# see src/core/overlay_artifact_registrar.py's module docstring for why a
+# new kind was required rather than reusing "render".
+ArtifactKind = Literal["audio", "visual", "animation", "render", "qc_report", "overlay_render"]

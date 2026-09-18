@@ -28,7 +28,7 @@ from src.models.enums import ArtifactKind
 # artifact (the assembled render, its QC report) and therefore must NOT
 # carry a scene_id — there is no such thing as "half a render".
 SCENE_LEVEL_ARTIFACT_KINDS: frozenset[str] = frozenset({"audio", "visual", "animation"})
-PROJECT_LEVEL_ARTIFACT_KINDS: frozenset[str] = frozenset({"render", "qc_report"})
+PROJECT_LEVEL_ARTIFACT_KINDS: frozenset[str] = frozenset({"render", "qc_report", "overlay_render"})
 
 # Same scene_id shape as src/models/scene.py's ScenePlanItem.scene_id —
 # duplicated here (rather than imported) because this is an independent

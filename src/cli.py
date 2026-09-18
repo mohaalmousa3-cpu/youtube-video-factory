@@ -2002,6 +2002,77 @@ def cmd_assemble_final_video(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_render_text_overlays(args: argparse.Namespace) -> int:
+    """TEXT OVERLAY RENDERER V1: local-only, deterministic drawtext
+    burn-in of every manifest-declared TextOverlay onto one project's
+    already-registered "render" artifact, producing a new, distinct
+    "overlay_render" artifact at --output. Never accepts an arbitrary
+    source MP4 — the render artifact is resolved internally from the
+    project's own registry. Local FFmpeg/ffprobe only — no provider, no
+    network call anywhere in this command path.
+
+    All SQLite access lives inside
+    src.core.text_overlay_render.render_text_overlays() itself (two
+    short-lived connections, opened and closed internally, never held
+    open across the FFmpeg work in between) — same three-part-lifecycle
+    shape as cmd_assemble_final_video, for the same reason.
+
+    JSON-mode failures are printed to stderr here, matching
+    cmd_assemble_final_video's own established (narrow, deliberate)
+    exception to this codebase's other 20+ commands' stdout-for-all-JSON
+    convention.
+
+    An undocumented/unexpected exception (not a TextOverlayRenderError
+    subclass) is caught at this boundary and reported as one short,
+    generic, sanitized message — never the original exception's own text,
+    traceback, or any environment/provider credential.
+    KeyboardInterrupt/SystemExit are BaseException, not Exception, so
+    neither is ever caught here."""
+    from src.core.text_overlay_render import TextOverlayRenderError, render_text_overlays
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"render-text-overlays: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {"ok": False, "project_id": args.project_id, "reason": reason}
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True), file=sys.stderr)
+        else:
+            print(f"render-text-overlays: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        result = render_text_overlays(args.project_id, Path(args.manifest), Path(args.output))
+    except TextOverlayRenderError as exc:
+        return _fail(str(exc))
+    except Exception:
+        return _fail("an unexpected internal error occurred")
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": result.project_id,
+            "output": str(result.output_path),
+            "overlay_count": result.overlay_count,
+            "measured_duration_seconds": result.measured_duration_seconds,
+            "artifact_id": result.artifact_id,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("render-text-overlays: OK (text overlays burned in and registered)")
+        print(f"  project_id: {result.project_id}")
+        print(f"  output: {result.output_path}")
+        print(f"  overlay_count: {result.overlay_count}")
+        print(f"  measured_duration_seconds: {result.measured_duration_seconds}")
+        print(f"  artifact_id: {result.artifact_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -2362,6 +2433,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     assemble_final_video.set_defaults(func=cmd_assemble_final_video)
+
+    render_text_overlays = sub.add_parser(
+        "render-text-overlays",
+        help="Local-only: burn every manifest-declared TextOverlay into one project's already-"
+        "registered render artifact and register the result as a new, distinct overlay_render "
+        "artifact; no provider, no network call",
+    )
+    render_text_overlays.add_argument("project_id")
+    render_text_overlays.add_argument(
+        "--manifest", required=True, help="Path to the enriched VideoManifest JSON"
+    )
+    render_text_overlays.add_argument(
+        "--output", required=True, help="Path to save the overlay-burned MP4; must not already exist"
+    )
+    render_text_overlays.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    render_text_overlays.set_defaults(func=cmd_render_text_overlays)
 
     return parser
 
