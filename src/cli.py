@@ -2353,6 +2353,103 @@ def cmd_plan_final_assembly(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_final_local(args: argparse.Namespace) -> int:
+    """LOCAL RESUME ORCHESTRATOR V1: local-only coordination of
+    assemble-final-video -> derive-text-overlays -> render-text-overlays
+    for one project, skipping any stage whose output already validly
+    exists (per the same planner that backs `plan-final-assembly`) and
+    never overwriting an existing caller file. No provider, no network
+    call, no direct call to FFmpeg/ffprobe or any other external process,
+    no artifact-verifier call, and no lifecycle/job/database-schema change
+    anywhere in this command path.
+
+    All SQLite access lives inside
+    src.core.local_resume_orchestrator.build_final_local() itself (short-
+    lived read-only connections only, plus whatever assemble_final_video()/
+    render_text_overlays() open and close internally) — this command
+    function opens no connection of its own, same shape as
+    cmd_assemble_final_video.
+
+    Success (exit code 0) means full completion only — stopped_at_stage is
+    None. Any blocked or failed partial result still prints the full
+    LocalResumeResult (ok: false) and returns a non-zero exit code; a
+    partial result is never treated as a hard failure printed to stderr
+    only, since it may include real work this command already completed
+    (e.g. a render it just created) that the caller needs to see. An
+    up-front LocalResumeOrchestratorError (invalid input or a path
+    collision, detected before any stage ran) is instead reported like
+    every other domain error on this command: text or JSON to stderr, no
+    result payload, since nothing was attempted at all.
+
+    An undocumented/unexpected exception is caught at this boundary and
+    reported as one short, generic, sanitized message — never the original
+    exception's own text, traceback, or any environment/provider
+    credential. KeyboardInterrupt/SystemExit are BaseException, not
+    Exception, so neither is ever caught here."""
+    from src.core.local_resume_orchestrator import LocalResumeOrchestratorError, build_final_local
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"build-final-local: FAILED — invalid --format {out_format!r} (expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {"ok": False, "project_id": args.project_id, "reason": reason}
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True), file=sys.stderr)
+        else:
+            print(f"build-final-local: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        result = build_final_local(
+            project_id=args.project_id,
+            timed_manifest_path=Path(args.timed_manifest),
+            derived_manifest_output_path=Path(args.derived_manifest_output),
+            render_output_path=Path(args.render_output),
+            overlay_output_path=Path(args.overlay_output),
+        )
+    except LocalResumeOrchestratorError as exc:
+        return _fail(str(exc))
+    except Exception:
+        return _fail("an unexpected internal error occurred")
+
+    ok = result.stopped_at_stage is None
+    payload = {
+        "ok": ok,
+        "project_id": result.project_id,
+        "render_status": result.render_status,
+        "render_artifact_id": result.render_artifact_id,
+        "render_output_path": result.render_output_path,
+        "derived_manifest_status": result.derived_manifest_status,
+        "derived_manifest_path": result.derived_manifest_path,
+        "overlay_render_status": result.overlay_render_status,
+        "overlay_render_artifact_id": result.overlay_render_artifact_id,
+        "overlay_render_output_path": result.overlay_render_output_path,
+        "stopped_at_stage": result.stopped_at_stage,
+        "blocked_reasons": list(result.blocked_reasons),
+        "notes": list(result.notes),
+    }
+    if out_format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print(f"build-final-local: {'OK' if ok else 'PARTIAL'} (ok={ok})")
+        for key, value in payload.items():
+            if key in ("ok", "blocked_reasons", "notes"):
+                continue
+            print(f"  {key}: {value}")
+        print("  blocked_reasons:")
+        for reason in result.blocked_reasons:
+            print(f"    - {reason}")
+        print("  notes:")
+        for note in result.notes:
+            print(f"    - {note}")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser without running anything — split out from
     main() so tests can inspect subcommand registration (e.g. that `health`
@@ -2765,6 +2862,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     plan_final_assembly.set_defaults(func=cmd_plan_final_assembly)
+
+    build_final_local = sub.add_parser(
+        "build-final-local",
+        help="Local-only: coordinate assemble-final-video -> derive-text-overlays -> "
+        "render-text-overlays for one project, skipping any stage whose output already validly "
+        "exists and never overwriting an existing caller file; no provider, no network call",
+    )
+    build_final_local.add_argument("project_id")
+    build_final_local.add_argument(
+        "--timed-manifest", required=True, help="Path to the finalize-scene-timing'd VideoManifest JSON"
+    )
+    build_final_local.add_argument(
+        "--derived-manifest-output",
+        required=True,
+        help="Path to write (or reuse, if it already matches deterministic derivation) the "
+        "derived-overlay manifest copy",
+    )
+    build_final_local.add_argument(
+        "--render-output", required=True, help="Path to save the final assembled MP4, if assembly is needed"
+    )
+    build_final_local.add_argument(
+        "--overlay-output", required=True, help="Path to save the overlay-burned MP4, if rendering is needed"
+    )
+    build_final_local.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    build_final_local.set_defaults(func=cmd_build_final_local)
 
     return parser
 
