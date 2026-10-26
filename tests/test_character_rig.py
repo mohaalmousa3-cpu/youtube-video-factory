@@ -7,7 +7,16 @@ from pathlib import Path
 
 from PIL import Image
 
-from src.render.character_rig import LimbBox, MouthBox, apply_limb_sway, apply_mouth_animation, draw_mouth, rotate_limb
+from src.render.character_rig import (
+    LimbBox,
+    MouthBox,
+    apply_limb_sway,
+    apply_mouth_and_limb_animation,
+    apply_mouth_animation,
+    draw_mouth,
+    draw_mouth_and_limb,
+    rotate_limb,
+)
 
 
 def _solid_image(size=(200, 200), color=(255, 255, 255, 255)) -> Image.Image:
@@ -65,4 +74,38 @@ def test_apply_limb_sway_writes_one_frame_per_angle(tmp_path):
     frames = apply_limb_sway(scene_path, box, [-5.0, 0.0, 5.0], tmp_path / "frames")
 
     assert len(frames) == 3
+    assert all(p.exists() for p in frames)
+
+
+def test_draw_mouth_and_limb_differs_from_either_alone():
+    # A solid-color base makes limb rotation a no-op in bytes (rotating a
+    # uniform region produces the same uniform region) -- paint a distinct
+    # patch inside the limb box so rotating it is actually observable.
+    base = _solid_image()
+    from PIL import ImageDraw as _ImageDraw
+
+    _ImageDraw.Draw(base).rectangle([65, 140, 135, 189], fill=(0, 0, 0, 255))
+    mouth_box = MouthBox(center_x=100, center_y=100, width=60, height=40)
+    limb_box = LimbBox(left=60, top=140, right=140, bottom=190, pivot_x=100, pivot_y=145)
+
+    combined = draw_mouth_and_limb(base, mouth_box, "D", limb_box, 15.0)
+    mouth_only = draw_mouth(base, mouth_box, "D")
+    limb_only = rotate_limb(base, limb_box, 15.0)
+
+    assert combined.size == base.size
+    assert combined.tobytes() != mouth_only.tobytes()
+    assert combined.tobytes() != limb_only.tobytes()
+
+
+def test_apply_mouth_and_limb_animation_writes_one_frame_per_cue(tmp_path):
+    scene_path = tmp_path / "scene.png"
+    _solid_image().save(scene_path)
+    mouth_box = MouthBox(center_x=100, center_y=100, width=60, height=40)
+    limb_box = LimbBox(left=60, top=140, right=140, bottom=190, pivot_x=100, pivot_y=145)
+    cues = [{"start": 0.0, "end": 0.2, "value": "X"}, {"start": 0.2, "end": 0.4, "value": "D"}]
+    angles = [0.0, 4.0]
+
+    frames = apply_mouth_and_limb_animation(scene_path, mouth_box, cues, limb_box, angles, tmp_path / "frames")
+
+    assert len(frames) == 2
     assert all(p.exists() for p in frames)

@@ -188,6 +188,44 @@ def apply_limb_sway(base_path: Path, box: LimbBox, angles: List[float], out_dir:
     return paths
 
 
+def draw_mouth_and_limb(
+    base: Image.Image, mouth_box: MouthBox, viseme: str, limb_box: LimbBox, angle_degrees: float
+) -> Image.Image:
+    """One frame with both effects applied: mouth patch+viseme first, then
+    limb rotation on top of that result — draw_mouth() and rotate_limb()
+    both take a base image and return a new one, so this is just chaining
+    them (rotate_limb(draw_mouth(base, ...), ...)), same as either is used
+    alone elsewhere in this module."""
+    return rotate_limb(draw_mouth(base, mouth_box, viseme), limb_box, angle_degrees)
+
+
+def apply_mouth_and_limb_animation(
+    scene_image_path: Path,
+    mouth_box: MouthBox,
+    mouth_cues: List[MouthCue],
+    limb_box: LimbBox,
+    angles: List[float],
+    out_dir: Path,
+) -> List[Path]:
+    """One frame per (cue, angle) pair, in lockstep — the caller derives
+    both lists from the same shared cue timeline (see
+    src.core.composite_scene_generation), so they are always the same
+    length by construction; this function does not re-derive or resample
+    either. Combines apply_mouth_animation()'s and apply_limb_sway()'s own
+    per-frame loops into one pass so each output frame is drawn once, not
+    composited from two separate frame sequences."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scene = Image.open(scene_image_path).convert("RGBA")
+
+    paths = []
+    for i, (cue, angle) in enumerate(zip(mouth_cues, angles)):
+        frame = draw_mouth_and_limb(scene, mouth_box, cue["value"], limb_box, angle)
+        path = out_dir / f"frame_{i:04d}.png"
+        frame.convert("RGB").save(path)
+        paths.append(path)
+    return paths
+
+
 def render_talking_frames(
     character_path: Path, background_path: Path, mouth_box: MouthBox, mouth_cues: List[MouthCue], out_dir: Path
 ) -> List[Path]:

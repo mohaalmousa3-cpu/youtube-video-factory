@@ -1664,6 +1664,163 @@ def cmd_build_limb_sway_clip(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_composite_scene_clip(args: argparse.Namespace) -> int:
+    """Generation-only: build one audio-muxed MP4 clip combining mouth
+    lip-sync AND limb sway for one scene, from its already-registered
+    visual/audio artifacts and the enriched manifest's measured audio
+    duration. Writes only the --output MP4 file — no SQLite write, no
+    artifact registration, no manifest change, no lifecycle transition.
+    Register the result separately with register-animation-artifact
+    (unchanged, run as its own later step).
+
+    Strictly read-only against SQLite: uses get_readonly_connection()
+    (never init_db()), same contract as build-mouth-animated-clip/
+    build-limb-sway-clip. The connection is closed before any Pillow,
+    Rhubarb, or ffmpeg work begins — src/core/composite_scene_generation.py
+    imports nothing from src.database."""
+    from src.core.composite_scene_generation import (
+        CompositeSceneGenerationError,
+        build_composite_scene_clip,
+    )
+    from src.core.manifest_store import ManifestStoreError, load_manifest
+    from src.core.path_safety import resolve_under_project_dir
+    from src.database.artifact_repository import list_artifacts_by_scene
+    from src.database.db import get_readonly_connection
+    from src.database.project_repository import get_project
+
+    out_format = args.format
+    if out_format not in {"text", "json"}:
+        print(
+            f"build-composite-scene-clip: FAILED — invalid --format {out_format!r} "
+            "(expected 'text' or 'json')",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _fail(reason: str) -> int:
+        if out_format == "json":
+            payload = {
+                "ok": False,
+                "project_id": args.project_id,
+                "scene_id": args.scene_id,
+                "reason": reason,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+        else:
+            print(f"build-composite-scene-clip: FAILED — {reason}", file=sys.stderr)
+        return 1
+
+    output_path = Path(args.output)
+
+    try:
+        conn = get_readonly_connection()
+    except sqlite3.Error:
+        return _fail("no local project database found")
+
+    try:
+        project = get_project(conn, args.project_id)
+        if project is None:
+            return _fail(f"unknown project_id {args.project_id!r}")
+
+        try:
+            manifest = load_manifest(Path(args.manifest))
+        except ManifestStoreError:
+            return _fail("could not load manifest at --manifest (unreadable or invalid)")
+
+        if manifest.project_id != args.project_id:
+            return _fail(f"--manifest project_id does not match project_id {args.project_id!r}")
+        if manifest.source_fingerprint != project.manifest_fingerprint:
+            return _fail(
+                "--manifest source_fingerprint does not match the project registry's recorded fingerprint"
+            )
+
+        scene = next((s for s in manifest.scene_plan.scenes if s.scene_id == args.scene_id), None)
+        if scene is None:
+            return _fail(f"unknown scene_id {args.scene_id!r} in the provided manifest")
+
+        project_dir_resolved = Path(project.manifest_path).resolve().parent
+
+        visual_artifacts = [
+            a for a in list_artifacts_by_scene(conn, args.project_id, args.scene_id) if a.kind == "visual"
+        ]
+        if len(visual_artifacts) == 0:
+            return _fail(f"no registered visual artifact found for scene_id {args.scene_id!r}")
+        if len(visual_artifacts) > 1:
+            return _fail(
+                f"multiple registered visual artifacts found for scene_id {args.scene_id!r} "
+                "(expected exactly 1)"
+            )
+        visual_artifact = visual_artifacts[0]
+        source_visual_path = resolve_under_project_dir(project_dir_resolved, visual_artifact.relative_path)
+        if source_visual_path is None:
+            return _fail("registered visual artifact path is unsafe")
+        if not source_visual_path.exists():
+            return _fail("registered visual artifact file is missing on disk")
+        if not source_visual_path.is_file():
+            return _fail("registered visual artifact path is not a regular file")
+        if source_visual_path.stat().st_size == 0:
+            return _fail("registered visual artifact file is empty")
+
+        audio_artifacts = [
+            a for a in list_artifacts_by_scene(conn, args.project_id, args.scene_id) if a.kind == "audio"
+        ]
+        if len(audio_artifacts) == 0:
+            return _fail(f"no registered audio artifact found for scene_id {args.scene_id!r}")
+        if len(audio_artifacts) > 1:
+            return _fail(
+                f"multiple registered audio artifacts found for scene_id {args.scene_id!r} "
+                "(expected exactly 1)"
+            )
+        audio_artifact = audio_artifacts[0]
+        source_audio_path = resolve_under_project_dir(project_dir_resolved, audio_artifact.relative_path)
+        if source_audio_path is None:
+            return _fail("registered audio artifact path is unsafe")
+        if not source_audio_path.exists():
+            return _fail("registered audio artifact file is missing on disk")
+        if not source_audio_path.is_file():
+            return _fail("registered audio artifact path is not a regular file")
+        if source_audio_path.stat().st_size == 0:
+            return _fail("registered audio artifact file is empty")
+    except sqlite3.Error:
+        # A DB read failure after the connection already opened
+        # successfully — distinct from get_readonly_connection() itself
+        # failing above, which already has its own specialized message.
+        return _fail("local project database could not be read")
+    finally:
+        conn.close()
+
+    try:
+        build_composite_scene_clip(
+            scene,
+            source_visual_path,
+            source_audio_path,
+            args.mouth_box,
+            args.limb_box,
+            args.sway_amplitude_degrees,
+            args.sway_cycles,
+            output_path,
+        )
+    except CompositeSceneGenerationError as exc:
+        return _fail(str(exc))
+
+    if out_format == "json":
+        payload = {
+            "ok": True,
+            "project_id": args.project_id,
+            "scene_id": args.scene_id,
+            "output": str(output_path),
+            "audio_muxed": True,
+            "registered": False,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        print("build-composite-scene-clip: OK (audio-muxed composite clip generated; not registered)")
+        print(f"  project_id: {args.project_id}")
+        print(f"  scene_id: {args.scene_id}")
+        print(f"  output: {output_path}")
+    return 0
+
+
 def cmd_preview_scene_image_prompt(args: argparse.Namespace) -> int:
     """Read-only: preview the exact image-generation prompt a future
     build-scene-image command would use for one scene, without calling any
@@ -2699,6 +2856,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", default="text", help="Output format: text (default) or json"
     )
     build_limb_sway_clip.set_defaults(func=cmd_build_limb_sway_clip)
+
+    build_composite_scene_clip = sub.add_parser(
+        "build-composite-scene-clip",
+        help="Generation-only: build one audio-muxed MP4 clip combining mouth lip-sync AND limb sway "
+        "for one scene from its already-registered visual/audio artifacts and the enriched manifest's "
+        "measured audio duration; writes only the --output MP4 — no SQLite write, no artifact "
+        "registration, no manifest change, no lifecycle transition; register the result separately "
+        "with register-animation-artifact; limb sway is evaluated as a continuous function of time "
+        "sampled at each Rhubarb mouth-cue timestamp, so there is no --frame-count option",
+    )
+    build_composite_scene_clip.add_argument("project_id")
+    build_composite_scene_clip.add_argument("scene_id")
+    build_composite_scene_clip.add_argument(
+        "--manifest", required=True, help="Path to the enriched VideoManifest JSON"
+    )
+    build_composite_scene_clip.add_argument(
+        "--mouth-box",
+        required=True,
+        help="CENTER_X,CENTER_Y,WIDTH,HEIGHT — hand-measured mouth rectangle for this scene image",
+    )
+    build_composite_scene_clip.add_argument(
+        "--limb-box",
+        required=True,
+        help="LEFT,TOP,RIGHT,BOTTOM,PIVOT_X,PIVOT_Y — hand-measured limb rectangle and pivot for this scene image",
+    )
+    build_composite_scene_clip.add_argument(
+        "--sway-amplitude-degrees", required=True, help="Peak sway angle in degrees (strict positive decimal)"
+    )
+    build_composite_scene_clip.add_argument(
+        "--sway-cycles",
+        default="1.0",
+        help="Number of full sway cycles across the clip's real measured audio duration "
+        "(strict positive decimal; default 1.0)",
+    )
+    build_composite_scene_clip.add_argument(
+        "--output", required=True, help="Path to save the generated MP4 clip; must not already exist"
+    )
+    build_composite_scene_clip.add_argument(
+        "--format", default="text", help="Output format: text (default) or json"
+    )
+    build_composite_scene_clip.set_defaults(func=cmd_build_composite_scene_clip)
 
     preview_scene_image_prompt = sub.add_parser(
         "preview-scene-image-prompt",
